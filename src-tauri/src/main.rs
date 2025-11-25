@@ -1,29 +1,95 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg(target_os = "windows")]
 
 use serde::{Deserialize, Serialize};
 use std::{
-    cmp::min,
-    fs::File,
-    io::Read,
+    collections::HashMap as StdHashMap,
+    ffi::OsStr,
+    fs,
+    mem,
+    os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
+    ptr,
+    slice,
     sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
-use ignore::{WalkBuilder, WalkState};
-use memchr::memmem::Finder;
-use regex::{bytes::Regex as BytesRegex, Regex, RegexBuilder};
-use time::{
-    format_description::FormatItem,
-    macros::format_description,
-    Date, PrimitiveDateTime, Time as TTime, UtcOffset,
+use ahash::{AHashMap as HashMap, AHashSet as HashSet};
+use arc_swap::ArcSwap;
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
+use ignore::WalkBuilder;
+use once_cell::sync::Lazy;
+use parking_lot::RwLock;
+use rayon::prelude::*;
+use tauri::Emitter;
+use time::{format_description::FormatItem, macros::format_description};
+use winapi::{
+    shared::{
+        minwindef::{DWORD, LPVOID},
+        ntdef::{HANDLE, LARGE_INTEGER, LONGLONG, ULONGLONG},
+        winerror::ERROR_HANDLE_EOF,
+    },
+    um::{
+        errhandlingapi::GetLastError,
+        fileapi::{CreateFileW, GetDriveTypeW, OPEN_EXISTING},
+        handleapi::{CloseHandle, INVALID_HANDLE_VALUE},
+        ioapiset::DeviceIoControl,
+        winbase::{FILE_FLAG_BACKUP_SEMANTICS, DRIVE_FIXED, DRIVE_REMOVABLE},
+        winnt::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN, FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ},
+    },
 };
 
-// ——— Входные/выходные структуры ———
+// ============ Windows API Constants ============
+
+const FSCTL_ENUM_USN_DATA: DWORD = 0x000900b3;
+const FSCTL_QUERY_USN_JOURNAL: DWORD = 0x000900f4;
+
+// ============ Windows Structures ============
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct MftEnumDataV0 {
+    start_file_reference_number: ULONGLONG,
+    low_usn: LONGLONG,
+    high_usn: LONGLONG,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+struct UsnJournalDataV0 {
+    usn_journal_id: ULONGLONG,
+    first_usn: LONGLONG,
+    next_usn: LONGLONG,
+    lowest_valid_usn: LONGLONG,
+    max_usn: LONGLONG,
+    maximum_size: ULONGLONG,
+    allocation_delta: ULONGLONG,
+}
+
+#[repr(C)]
+#[allow(dead_code)]
+struct UsnRecordV2 {
+    record_length: DWORD,
+    major_version: u16,
+    minor_version: u16,
+    file_reference_number: ULONGLONG,
+    parent_file_reference_number: ULONGLONG,
+    usn: LONGLONG,
+    time_stamp: LARGE_INTEGER,
+    reason: DWORD,
+    source_info: DWORD,
+    security_id: DWORD,
+    file_attributes: DWORD,
+    file_name_length: u16,
+    file_name_offset: u16,
+}
+
+// ============ Data Structures ============
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -31,18 +97,8 @@ struct FilterOptions {
     file_types: Vec<String>,
     min_size: Option<u64>,
     max_size: Option<u64>,
-    modified_from: Option<String>,
-    modified_to: Option<String>,
-    include_paths: Vec<String>,
-    exclude_paths: Vec<String>,
-    search_mode: String, // "substring" | "regex" | "fuzzy"
-    case_sensitive: bool,
-    search_in_content: bool,
-    follow_symlinks: bool,
     include_hidden: bool,
     max_results: u32,
-    // область поиска: "full" | "home" | "cwd" | "custom"
-    search_scope: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -56,480 +112,926 @@ struct SearchResult {
     score: Option<f32>,
 }
 
-// ——— Вспомогательные константы/типы ———
-
-const MAX_CONTENT_BYTES: usize = 8 * 1024 * 1024;
-
-// Тут был E0121: нужен полный тип для массива формат-элементов
-const DATE_FMT: &[FormatItem<'static>] =
-    format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
-
-#[derive(Copy, Clone)]
-enum SearchMode {
-    Substring,
-    Regex,
-    Fuzzy,
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct DriveInfo {
+    letter: char,
+    drive_type: String,
+    available: bool,
 }
 
-// ——— Основная команда ———
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct DriveProgress {
+    letter: char,
+    scanned: u64,
+    finished: bool,
+    method: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct IndexState {
+    running: bool,
+    drives: Vec<DriveProgress>,
+    total_scanned: u64,
+    total_files: u64,
+    total_dirs: u64,
+    elapsed_ms: u64,
+    finished: bool,
+}
+
+// ============ Compact Entry ============
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Entry {
+    name_off: u32,
+    name_len: u16,
+    path_off: u32,
+    path_len: u32,
+    size: u64,
+    modified: u64,
+    flags: u16,
+}
+
+impl Entry {
+    #[inline]
+    fn is_dir(&self) -> bool {
+        (self.flags & 0x01) != 0
+    }
+
+    #[inline]
+    fn is_hidden(&self) -> bool {
+        (self.flags & 0x02) != 0
+    }
+}
+
+// ============ Fast Trie with String Interning ============
+
+#[derive(Default)]
+struct TrieNode {
+    children: HashMap<char, Box<TrieNode>>,
+    entry_ids: Vec<u32>,
+}
+
+impl TrieNode {
+    fn insert(&mut self, key: &str, id: u32) {
+        let mut node = self;
+        for ch in key.chars() {
+            node = node.children.entry(ch).or_insert_with(|| Box::new(TrieNode::default()));
+        }
+        node.entry_ids.push(id);
+    }
+
+    fn search_prefix(&self, prefix: &str) -> HashSet<u32> {
+        let mut node = self;
+        for ch in prefix.chars() {
+            match node.children.get(&ch) {
+                Some(n) => node = n,
+                None => return HashSet::default(),
+            }
+        }
+        let mut results = HashSet::default();
+        let mut stack = vec![node];
+        while let Some(n) = stack.pop() {
+            results.extend(&n.entry_ids);
+            for child in n.children.values() {
+                stack.push(child.as_ref());
+            }
+        }
+        results
+    }
+}
+
+// ============ Index ============
+
+struct Index {
+    entries: Vec<Entry>,
+    arena: Vec<u8>,
+    name_trie: TrieNode,
+    extension_map: HashMap<String, Vec<u32>>,
+}
+
+impl Index {
+    #[inline]
+    fn str_at(&self, off: u32, len: usize) -> &str {
+        unsafe { std::str::from_utf8_unchecked(&self.arena[off as usize..off as usize + len]) }
+    }
+
+    #[inline]
+    fn entry_name(&self, e: &Entry) -> &str {
+        self.str_at(e.name_off, e.name_len as usize)
+    }
+
+    #[inline]
+    fn entry_path(&self, e: &Entry) -> &str {
+        self.str_at(e.path_off, e.path_len as usize)
+    }
+
+    fn search_candidates(&self, query: &str) -> Vec<u32> {
+        let q = query.to_lowercase();
+        let mut candidates = self.name_trie.search_prefix(&q);
+
+        if !q.contains('.') {
+            if let Some(ids) = self.extension_map.get(&q) {
+                candidates.extend(ids);
+            }
+        }
+
+        let mut result: Vec<u32> = candidates.into_iter().collect();
+        result.sort_unstable();
+        result.dedup();
+        result
+    }
+}
+
+// ============ Thread-Safe Index Builder ============
+
+struct FileEntry {
+    name: String,
+    path: String,
+    is_dir: bool,
+    is_hidden: bool,
+    size: u64,
+    modified: u64,
+}
+
+struct IndexBuilder {
+    entries: Vec<Entry>,
+    arena: Vec<u8>,
+    name_trie: TrieNode,
+    extension_map: HashMap<String, Vec<u32>>,
+}
+
+impl IndexBuilder {
+    fn new() -> Self {
+        Self {
+            entries: Vec::with_capacity(500_000),
+            arena: Vec::with_capacity(50_000_000),
+            name_trie: TrieNode::default(),
+            extension_map: HashMap::default(),
+        }
+    }
+
+    fn intern(&mut self, s: &str) -> (u32, usize) {
+        let off = self.arena.len() as u32;
+        self.arena.extend_from_slice(s.as_bytes());
+        (off, s.len())
+    }
+
+    fn add_batch(&mut self, batch: Vec<FileEntry>) {
+        for entry in batch {
+            self.add_entry(&entry.name, &entry.path, entry.is_dir, entry.is_hidden, entry.size, entry.modified);
+        }
+    }
+
+    fn add_entry(&mut self, name: &str, full_path: &str, is_dir: bool, is_hidden: bool, size: u64, modified: u64) {
+        let id = self.entries.len() as u32;
+        let (name_off, name_len_usize) = self.intern(name);
+        let (path_off, path_len) = self.intern(full_path);
+        let name_len = name_len_usize.min(u16::MAX as usize) as u16;
+
+        let mut flags = 0u16;
+        if is_dir {
+            flags |= 0x01;
+        }
+        if is_hidden {
+            flags |= 0x02;
+        }
+
+        self.entries.push(Entry {
+            name_off,
+            name_len,
+            path_off,
+            path_len: path_len as u32,
+            size,
+            modified,
+            flags,
+        });
+
+        let name_lower = name.to_lowercase();
+        self.name_trie.insert(&name_lower, id);
+
+        if !is_dir {
+            if let Some(ext_start) = name.rfind('.') {
+                let ext = name[ext_start + 1..].to_lowercase();
+                if !ext.is_empty() {
+                    self.extension_map.entry(ext).or_default().push(id);
+                }
+            }
+        }
+    }
+
+    fn finalize(mut self) -> Index {
+        for ids in self.extension_map.values_mut() {
+            ids.sort_unstable();
+            ids.dedup();
+        }
+
+        Index {
+            entries: self.entries,
+            arena: self.arena,
+            name_trie: self.name_trie,
+            extension_map: self.extension_map,
+        }
+    }
+}
+
+// ============ MFT Scanner ============
+
+struct MftScanner {
+    drive_letter: char,
+    volume_handle: HANDLE,
+}
+
+impl MftScanner {
+    unsafe fn open(drive_letter: char) -> Result<Self, String> {
+        let volume_path = format!("\\\\.\\{}:", drive_letter);
+        let wide: Vec<u16> = OsStr::new(&volume_path).encode_wide().chain(Some(0)).collect();
+
+        let handle = CreateFileW(
+            wide.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            ptr::null_mut(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            ptr::null_mut(),
+        );
+
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(format!("Cannot open volume {}", drive_letter));
+        }
+
+        Ok(Self {
+            drive_letter,
+            volume_handle: handle,
+        })
+    }
+
+    unsafe fn query_usn_journal(&self) -> Result<UsnJournalDataV0, String> {
+        let mut journal_data: UsnJournalDataV0 = mem::zeroed();
+        let mut bytes_returned: DWORD = 0;
+
+        let result = DeviceIoControl(
+            self.volume_handle,
+            FSCTL_QUERY_USN_JOURNAL,
+            ptr::null_mut(),
+            0,
+            &mut journal_data as *mut _ as LPVOID,
+            mem::size_of::<UsnJournalDataV0>() as DWORD,
+            &mut bytes_returned,
+            ptr::null_mut(),
+        );
+
+        if result == 0 {
+            return Err(format!("FSCTL_QUERY_USN_JOURNAL failed: {}", GetLastError()));
+        }
+
+        Ok(journal_data)
+    }
+
+    unsafe fn enumerate_mft(&self, tx: Sender<Vec<FileEntry>>) -> Result<u64, String> {
+        let journal_data = self.query_usn_journal()?;
+
+        let mut enum_data = MftEnumDataV0 {
+            start_file_reference_number: 0,
+            low_usn: 0,
+            high_usn: journal_data.next_usn,
+        };
+
+        const BUFFER_SIZE: usize = 8 * 1024 * 1024;
+        let mut buffer = vec![0u8; BUFFER_SIZE];
+        let mut total_count = 0u64;
+        let mut path_map: HashMap<u64, String> = HashMap::default();
+        path_map.insert(0x5000000000005, format!("{}:\\", self.drive_letter));
+
+        let mut batch: Vec<FileEntry> = Vec::with_capacity(10000);
+
+        loop {
+            if CANCEL_FLAG.load(Ordering::Relaxed) {
+                return Ok(total_count);
+            }
+
+            let mut bytes_returned: DWORD = 0;
+            let result = DeviceIoControl(
+                self.volume_handle,
+                FSCTL_ENUM_USN_DATA,
+                &mut enum_data as *mut _ as LPVOID,
+                mem::size_of::<MftEnumDataV0>() as DWORD,
+                buffer.as_mut_ptr() as LPVOID,
+                BUFFER_SIZE as DWORD,
+                &mut bytes_returned,
+                ptr::null_mut(),
+            );
+
+            if result == 0 {
+                let err = GetLastError();
+                if err == ERROR_HANDLE_EOF {
+                    break;
+                }
+                return Err(format!("MFT read error: {}", err));
+            }
+
+            if bytes_returned < 8 {
+                break;
+            }
+
+            let mut offset = 8usize;
+
+            while offset + mem::size_of::<UsnRecordV2>() <= bytes_returned as usize {
+                let record_ptr = buffer.as_ptr().add(offset) as *const UsnRecordV2;
+                let record = &*record_ptr;
+
+                if record.record_length == 0 || record.record_length > 0x10000 {
+                    break;
+                }
+
+                let filename_offset = offset + record.file_name_offset as usize;
+                let filename_len = (record.file_name_length / 2) as usize;
+
+                if filename_offset + filename_len * 2 <= bytes_returned as usize {
+                    let filename_ptr = buffer.as_ptr().add(filename_offset) as *const u16;
+                    let filename_slice = slice::from_raw_parts(filename_ptr, filename_len);
+                    let filename = String::from_utf16_lossy(filename_slice);
+
+                    if filename != "." && filename != ".." && !filename.starts_with("$") {
+                        let is_dir = (record.file_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+                        let is_hidden = (record.file_attributes & FILE_ATTRIBUTE_HIDDEN) != 0;
+
+                        let parent_path = path_map.get(&record.parent_file_reference_number).map(|s| s.as_str()).unwrap_or("");
+
+                        let full_path = if parent_path.ends_with('\\') {
+                            format!("{}{}", parent_path, filename)
+                        } else if parent_path.is_empty() {
+                            format!("{}:\\{}", self.drive_letter, filename)
+                        } else {
+                            format!("{}\\{}", parent_path, filename)
+                        };
+
+                        if is_dir {
+                            path_map.insert(record.file_reference_number, full_path.clone());
+                        }
+
+                        let modified = {
+                            let ft = *record.time_stamp.QuadPart() as u64;
+                            if ft > 116444736000000000 {
+                                (ft - 116444736000000000) / 10000000
+                            } else {
+                                0
+                            }
+                        };
+
+                        batch.push(FileEntry {
+                            name: filename,
+                            path: full_path,
+                            is_dir,
+                            is_hidden,
+                            size: 0,
+                            modified,
+                        });
+
+                        total_count += 1;
+
+                        if batch.len() >= 5000 {
+                            let _ = tx.send(std::mem::replace(&mut batch, Vec::with_capacity(10000)));
+                        }
+                    }
+                }
+
+                enum_data.start_file_reference_number = record.file_reference_number;
+                offset += record.record_length as usize;
+            }
+        }
+
+        if !batch.is_empty() {
+            let _ = tx.send(batch);
+        }
+
+        Ok(total_count)
+    }
+}
+
+impl Drop for MftScanner {
+    fn drop(&mut self) {
+        unsafe {
+            if self.volume_handle != INVALID_HANDLE_VALUE {
+                CloseHandle(self.volume_handle);
+            }
+        }
+    }
+}
+
+// ============ Fallback Scanner ============
+
+fn scan_drive_fallback(drive: char, tx: Sender<Vec<FileEntry>>) -> Result<u64, String> {
+    let root = format!("{}:\\", drive);
+    let mut count = 0u64;
+    let mut batch: Vec<FileEntry> = Vec::with_capacity(5000);
+
+    let walker = WalkBuilder::new(&root)
+        .hidden(false)
+        .follow_links(false)
+        .threads(4)
+        .build_parallel();
+
+    let (entry_tx, entry_rx) = unbounded::<FileEntry>();
+
+    walker.run(|| {
+        let tx = entry_tx.clone();
+        Box::new(move |entry| {
+            if CANCEL_FLAG.load(Ordering::Relaxed) {
+                return ignore::WalkState::Quit;
+            }
+
+            if let Ok(entry) = entry {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+                let full_path = path.to_string_lossy().to_string();
+
+                let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+                let is_hidden = name.starts_with('.');
+
+                let (size, modified) = if let Ok(meta) = entry.metadata() {
+                    let sz = if is_dir { 0 } else { meta.len() };
+                    let mt = meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    (sz, mt)
+                } else {
+                    (0, 0)
+                };
+
+                let _ = tx.send(FileEntry {
+                    name,
+                    path: full_path,
+                    is_dir,
+                    is_hidden,
+                    size,
+                    modified,
+                });
+            }
+
+            ignore::WalkState::Continue
+        })
+    });
+
+    drop(entry_tx);
+
+    for entry in entry_rx {
+        batch.push(entry);
+        count += 1;
+
+        if batch.len() >= 5000 {
+            let _ = tx.send(std::mem::replace(&mut batch, Vec::with_capacity(5000)));
+        }
+    }
+
+    if !batch.is_empty() {
+        let _ = tx.send(batch);
+    }
+
+    Ok(count)
+}
+
+// ============ Global State ============
+
+static INDEX: Lazy<ArcSwap<Option<Arc<Index>>>> = Lazy::new(|| ArcSwap::new(Arc::new(None)));
+static INDEX_STATE: Lazy<RwLock<IndexState>> = Lazy::new(|| {
+    RwLock::new(IndexState {
+        running: false,
+        drives: Vec::new(),
+        total_scanned: 0,
+        total_files: 0,
+        total_dirs: 0,
+        elapsed_ms: 0,
+        finished: false,
+    })
+});
+static CANCEL_FLAG: AtomicBool = AtomicBool::new(false);
+
+fn get_drive_type_string(drive_letter: char) -> String {
+    unsafe {
+        let path = format!("{}:\\", drive_letter);
+        let wide: Vec<u16> = OsStr::new(&path).encode_wide().chain(Some(0)).collect();
+        let drive_type = GetDriveTypeW(wide.as_ptr());
+        match drive_type {
+            DRIVE_FIXED => "Локальный диск".to_string(),
+            DRIVE_REMOVABLE => "Съёмный диск".to_string(),
+            _ => "Другой".to_string(),
+        }
+    }
+}
+
+fn list_available_drives() -> Vec<DriveInfo> {
+    (b'C'..=b'Z')
+        .filter_map(|letter| {
+            let ch = letter as char;
+            let drive = format!("{}:\\", ch);
+            if Path::new(&drive).exists() {
+                Some(DriveInfo {
+                    letter: ch,
+                    drive_type: get_drive_type_string(ch),
+                    available: true,
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn emit_state(app: &tauri::AppHandle) {
+    let state = INDEX_STATE.read().clone();
+    let _ = app.emit("index:state", state);
+}
+
+// ============ Commands ============
+
+#[tauri::command]
+fn get_available_drives() -> Vec<DriveInfo> {
+    list_available_drives()
+}
+
+#[tauri::command]
+async fn start_indexing(app: tauri::AppHandle, selected_drives: Vec<char>) -> Result<(), String> {
+    if selected_drives.is_empty() {
+        return Err("Выберите хотя бы один диск".to_string());
+    }
+
+    CANCEL_FLAG.store(false, Ordering::Relaxed);
+
+    {
+        let mut state = INDEX_STATE.write();
+        *state = IndexState {
+            running: true,
+            drives: selected_drives
+                .iter()
+                .map(|&letter| DriveProgress {
+                    letter,
+                    scanned: 0,
+                    finished: false,
+                    method: String::new(),
+                })
+                .collect(),
+            total_scanned: 0,
+            total_files: 0,
+            total_dirs: 0,
+            elapsed_ms: 0,
+            finished: false,
+        };
+    }
+    emit_state(&app);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let start_time = Instant::now();
+        let (entry_tx, entry_rx) = unbounded::<Vec<FileEntry>>();
+
+        let handles: Vec<_> = selected_drives
+            .iter()
+            .map(|&drive| {
+                let tx = entry_tx.clone();
+                let app_clone = app.clone();
+
+                thread::spawn(move || {
+                    let count = unsafe {
+                        match MftScanner::open(drive) {
+                            Ok(scanner) => {
+                                {
+                                    let mut state = INDEX_STATE.write();
+                                    if let Some(d) = state.drives.iter_mut().find(|d| d.letter == drive) {
+                                        d.method = "MFT".to_string();
+                                    }
+                                }
+                                scanner.enumerate_mft(tx.clone())
+                            }
+                            Err(_) => {
+                                {
+                                    let mut state = INDEX_STATE.write();
+                                    if let Some(d) = state.drives.iter_mut().find(|d| d.letter == drive) {
+                                        d.method = "Walker".to_string();
+                                    }
+                                }
+                                scan_drive_fallback(drive, tx.clone())
+                            }
+                        }
+                    };
+
+                    {
+                        let mut state = INDEX_STATE.write();
+                        if let Some(d) = state.drives.iter_mut().find(|d| d.letter == drive) {
+                            d.finished = true;
+                            if let Ok(c) = count {
+                                d.scanned = c;
+                            }
+                        }
+                    }
+                    emit_state(&app_clone);
+
+                    count
+                })
+            })
+            .collect();
+
+        drop(entry_tx);
+
+        let mut builder = IndexBuilder::new();
+        let mut last_emit = Instant::now();
+
+        for batch in entry_rx {
+            if CANCEL_FLAG.load(Ordering::Relaxed) {
+                break;
+            }
+
+            let files_count = batch.iter().filter(|e| !e.is_dir).count() as u64;
+            let dirs_count = batch.iter().filter(|e| e.is_dir).count() as u64;
+
+            builder.add_batch(batch);
+
+            {
+                let mut state = INDEX_STATE.write();
+                state.total_scanned = builder.entries.len() as u64;
+                state.total_files += files_count;
+                state.total_dirs += dirs_count;
+            }
+
+            if last_emit.elapsed() > Duration::from_millis(100) {
+                emit_state(&app);
+                last_emit = Instant::now();
+            }
+        }
+
+        for handle in handles {
+            let _ = handle.join();
+        }
+
+        if !CANCEL_FLAG.load(Ordering::Relaxed) {
+            let index = builder.finalize();
+            INDEX.store(Arc::new(Some(Arc::new(index))));
+        }
+
+        {
+            let mut state = INDEX_STATE.write();
+            state.running = false;
+            state.finished = true;
+            state.elapsed_ms = start_time.elapsed().as_millis() as u64;
+        }
+        emit_state(&app);
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+fn get_index_status() -> Result<IndexState, String> {
+    Ok(INDEX_STATE.read().clone())
+}
 
 #[tauri::command]
 async fn search(query: String, filters: FilterOptions) -> Vec<SearchResult> {
-    let q = query.trim().to_string();
+    let q = query.trim();
     if q.is_empty() {
         return vec![];
     }
 
-    // Режим поиска как enum (надёжнее, чем сравнивать строки потом)
-    let mode = match filters.search_mode.as_str() {
-        "regex" => SearchMode::Regex,
-        "fuzzy" => SearchMode::Fuzzy,
-        _ => SearchMode::Substring,
-    };
-    let case_sensitive = filters.case_sensitive;
-
-    // Готовим варианты запроса
-    let q_norm_str = if case_sensitive { q.clone() } else { q.to_lowercase() };
-
-    // Компилируем матчеры по имени
-    let re_name = match mode {
-        SearchMode::Regex => Some(
-            RegexBuilder::new(&q)
-                .case_insensitive(!case_sensitive)
-                .build()
-                .unwrap_or_else(|_| Regex::new("$^").unwrap()),
-        ),
-        _ => None,
+    let index_guard = INDEX.load();
+    let index = match index_guard.as_ref() {
+        Some(idx) => idx.clone(),
+        None => return vec![],
     };
 
-    // Матчеры по содержимому (опционально)
-    let finder_cs = match mode {
-        SearchMode::Substring => Some(Finder::new(q.as_bytes())),
-        _ => None,
-    };
-    let finder_ci = match (mode, case_sensitive) {
-        (SearchMode::Substring, false) => Some(Finder::new(q_norm_str.as_bytes())),
-        _ => None,
-    };
-    let re_bytes = match (mode, filters.search_in_content) {
-        (SearchMode::Regex, true) => Some(
-            regex::bytes::RegexBuilder::new(&q)
-                .case_insensitive(!case_sensitive)
-                .build()
-                .unwrap_or_else(|_| BytesRegex::new("$^").unwrap()),
-        ),
-        _ => None,
-    };
-
-    // Расширения
-    let mut exts: Vec<String> = filters
-        .file_types
-        .iter()
-        .map(|s| s.trim().trim_start_matches('.').to_lowercase())
-        .filter(|s| !s.is_empty())
-        .collect();
-    exts.sort();
-    exts.dedup();
-
-    // Корни обхода: весь ПК по умолчанию
-    let roots = roots_for_scope(&filters);
-
-    // Исключения
-    let (exclude_prefixes, globset) = build_excluders(&filters.exclude_paths);
-
-    // Фильтр дат
-    let from_time = parse_ymd_to_system_time(filters.modified_from.as_deref());
-    let to_time = parse_ymd_to_system_time(filters.modified_to.as_deref())
-        .map(|t| t + Duration::from_secs(24 * 3600 - 1));
-
-    // Лимит
+    let candidates = index.search_candidates(q);
     let max_results = filters.max_results as usize;
 
-    // Общие состояния
-    let found = Arc::new(AtomicUsize::new(0));
-    let results: Arc<Mutex<Vec<SearchResult>>> =
-        Arc::new(Mutex::new(Vec::with_capacity(min(1024, max_results))));
-    let local_offset = UtcOffset::current_local_offset().ok();
+    let mut results: Vec<SearchResult> = candidates
+        .par_iter()
+        .filter_map(|&id| {
+            let entry = index.entries.get(id as usize)?;
 
-    // WalkBuilder без игноров (полное сканирование)
-    let mut builder = WalkBuilder::new(&roots[0]);
-    for r in roots.iter().skip(1) {
-        builder.add(r);
-    }
-    builder
-        .hidden(!filters.include_hidden)
-        .follow_links(filters.follow_symlinks)
-        .ignore(false)
-        .git_ignore(false)
-        .git_global(false)
-        .git_exclude(false);
-
-    // Делимся данными между потоками через Arc
-    let q_arc = Arc::new(q.clone()); // <- клонируем, чтобы не «переносить» q
-    let q_norm_arc = Arc::new(q_norm_str.clone());
-    let re_name = Arc::new(re_name);
-    let re_bytes = Arc::new(re_bytes);
-    let finder_cs = Arc::new(finder_cs);
-    let finder_ci = Arc::new(finder_ci);
-    let exts_arc = Arc::new(exts);
-    let globset = Arc::new(globset);
-    let exclude_prefixes = Arc::new(exclude_prefixes);
-
-    let min_size = filters.min_size;
-    let max_size = filters.max_size;
-    let search_in_content = filters.search_in_content;
-
-    builder.build_parallel().run(|| {
-        // Эта фабрика вызывается для каждого воркера — внутри клонируем Arc
-        let results = Arc::clone(&results);
-        let found = Arc::clone(&found);
-
-        let re_name = Arc::clone(&re_name);
-        let re_bytes = Arc::clone(&re_bytes);
-        let finder_cs = Arc::clone(&finder_cs);
-        let finder_ci = Arc::clone(&finder_ci);
-        let q = Arc::clone(&q_arc);
-        let q_norm = Arc::clone(&q_norm_arc);
-        let exts = Arc::clone(&exts_arc);
-        let globset = Arc::clone(&globset);
-        let exclude_prefixes = Arc::clone(&exclude_prefixes);
-
-        Box::new(move |res| {
-            if found.load(Ordering::Relaxed) >= max_results {
-                return WalkState::Quit;
+            if !filters.include_hidden && entry.is_hidden() {
+                return None;
             }
 
-            let entry = match res {
-                Ok(e) => e,
-                Err(_) => return WalkState::Continue,
-            };
-            let path = entry.path();
-
-            // Исключения
-            if is_excluded(path, &exclude_prefixes, globset.as_ref()) {
-                return WalkState::Continue;
-            }
-
-            // Имя и тип
-            let name_os = entry.file_name();
-            let name = name_os.to_string_lossy();
-            let is_dir = match entry.file_type() {
-                Some(ft) => ft.is_dir(),
-                None => path.is_dir(),
-            };
-
-            // Фильтр по расширению (только файлы)
-            if !is_dir && !exts.is_empty() {
-                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                    if !exts.binary_search(&ext.to_lowercase()).is_ok() {
-                        return WalkState::Continue;
-                    }
-                } else {
-                    return WalkState::Continue;
-                }
-            }
-
-            // Метаданные
-            let meta = entry.metadata().ok();
-            let (size, modified_opt, is_file) = match meta {
-                Some(m) => {
-                    let ft = m.file_type();
-                    let is_file = ft.is_file();
-                    let sz = if is_dir { 0 } else { m.len() };
-                    let modified = m.modified().ok();
-                    (sz, modified, is_file)
-                }
-                None => (0, None, false),
-            };
-
-            // Размеры
-            if !is_dir {
-                if let Some(min_s) = min_size {
-                    if size < min_s {
-                        return WalkState::Continue;
+            if !entry.is_dir() {
+                if let Some(min_size) = filters.min_size {
+                    if entry.size < min_size {
+                        return None;
                     }
                 }
-                if let Some(max_s) = max_size {
-                    if size > max_s {
-                        return WalkState::Continue;
+                if let Some(max_size) = filters.max_size {
+                    if entry.size > max_size {
+                        return None;
                     }
                 }
             }
 
-            // Даты
-            if let Some(modified) = modified_opt {
-                if let Some(from) = from_time {
-                    if modified < from {
-                        return WalkState::Continue;
-                    }
-                }
-                if let Some(to) = to_time {
-                    if modified > to {
-                        return WalkState::Continue;
-                    }
-                }
-            }
+            if !filters.file_types.is_empty() && !entry.is_dir() {
+                let name = index.entry_name(entry);
+                let ext = name.rfind('.').map(|i| &name[i + 1..]).unwrap_or("");
+                let ext_lower = ext.to_lowercase();
 
-            // Матч по имени
-            let mut matched = false;
-            let mut score: Option<f32> = None;
-            match mode {
-                SearchMode::Substring => {
-                    if case_sensitive {
-                        matched = name.contains(q.as_str());
-                    } else {
-                        matched = name.to_lowercase().contains(q_norm.as_str());
-                    }
-                }
-                SearchMode::Regex => {
-                    if let Some(re) = re_name.as_ref() {
-                        matched = re.is_match(&name);
-                    }
-                }
-                SearchMode::Fuzzy => {
-                    if let Some(s) = fuzzy_score(&name, q.as_str(), case_sensitive) {
-                        matched = true;
-                        score = Some(s);
-                    }
+                if !filters.file_types.iter().any(|ft| {
+                    let ft_clean = ft.trim_start_matches('.');
+                    ft_clean.eq_ignore_ascii_case(&ext_lower)
+                }) {
+                    return None;
                 }
             }
 
-            // Поиск в содержимом
-            if !matched && search_in_content && is_file {
-                if let Ok(mut f) = File::open(path) {
-                    let cap = std::cmp::min(size as usize, MAX_CONTENT_BYTES);
-                    let mut buf = Vec::with_capacity(cap);
-                    let _ = f.take(cap as u64).read_to_end(&mut buf);
-                    match mode {
-                        SearchMode::Substring => {
-                            if case_sensitive {
-                                if let Some(finder) = finder_cs.as_ref() {
-                                    matched = finder.find(&buf).is_some();
-                                }
-                            } else {
-                                let lowered = match std::str::from_utf8(&buf) {
-                                    Ok(s) => s.to_lowercase().into_bytes(),
-                                    Err(_) => buf
-                                        .iter()
-                                        .map(|b| if b.is_ascii_uppercase() { b.to_ascii_lowercase() } else { *b })
-                                        .collect(),
-                                };
-                                if let Some(finder) = finder_ci.as_ref() {
-                                    matched = finder.find(&lowered).is_some();
-                                }
-                            }
-                        }
-                        SearchMode::Regex => {
-                            if let Some(reb) = re_bytes.as_ref() {
-                                matched = reb.is_match(&buf);
-                            }
-                        }
-                        SearchMode::Fuzzy => { /* обычно не ищут по содержимому */ }
-                    }
-                }
+            let name = index.entry_name(entry).to_string();
+            let path = index.entry_path(entry).to_string();
+
+            let q_lower = q.to_lowercase();
+            let name_lower = name.to_lowercase();
+
+            if !name_lower.contains(&q_lower) {
+                return None;
             }
 
-            if !matched {
-                return WalkState::Continue;
-            }
-
-            let modified_str = modified_opt
-                .and_then(|t| format_system_time_local(t, local_offset))
-                .unwrap_or_default();
-
-            let mut guard = results.lock().unwrap();
-            guard.push(SearchResult {
-                name: name.to_string(),
-                path: path.to_string_lossy().to_string(),
-                size,
-                modified: modified_str,
-                is_dir,
-                score,
-            });
-
-            let n = found.fetch_add(1, Ordering::Relaxed) + 1;
-            if n >= max_results {
-                return WalkState::Quit;
-            }
-            WalkState::Continue
-        })
-    });
-
-    let mut out = Arc::try_unwrap(results).unwrap().into_inner().unwrap();
-    // Немного сортируем: папки выше, потом по score
-    out.sort_by(|a, b| match (a.is_dir, b.is_dir) {
-        (true, false) => std::cmp::Ordering::Less,
-        (false, true) => std::cmp::Ordering::Greater,
-        _ => b
-            .score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal),
-    });
-    out
-}
-
-// ——— Утилиты ———
-
-fn is_glob(s: &str) -> bool {
-    s.contains('*') || s.contains('?') || s.contains('[')
-}
-
-fn build_excluders(patterns: &[String]) -> (Vec<PathBuf>, GlobSet) {
-    let mut prefixes = Vec::new();
-    let mut gb = GlobSetBuilder::new();
-
-    for raw in patterns {
-        let p = raw.trim();
-        if p.is_empty() {
-            continue;
-        }
-
-        if !is_glob(p) && !p.contains(std::path::MAIN_SEPARATOR) {
-            let g1 = format!("**/{p}/**");
-            let g2 = format!("**/{p}");
-            let _ = gb.add(GlobBuilder::new(&g1).build().unwrap());
-            let _ = gb.add(GlobBuilder::new(&g2).build().unwrap());
-            continue;
-        }
-
-        if is_glob(p) {
-            let _ = gb.add(GlobBuilder::new(p).build().unwrap());
-        } else {
-            prefixes.push(PathBuf::from(p));
-        }
-    }
-
-    let gs = gb.build().unwrap_or_else(|_| GlobSetBuilder::new().build().unwrap());
-    (prefixes, gs)
-}
-
-fn is_excluded(path: &Path, prefixes: &[PathBuf], gs: &GlobSet) -> bool {
-    if prefixes.iter().any(|p| path.starts_with(p)) {
-        return true;
-    }
-    gs.is_match(path)
-}
-
-fn parse_ymd_to_system_time(s: Option<&str>) -> Option<SystemTime> {
-    let s = s?;
-    let date = Date::parse(s, format_description!("[year]-[month]-[day]")).ok()?;
-    let pdt = PrimitiveDateTime::new(date, TTime::MIDNIGHT);
-    let odt = if let Ok(off) = UtcOffset::current_local_offset() {
-        pdt.assume_offset(off)
-    } else {
-        pdt.assume_utc()
-    };
-    let ts = odt.unix_timestamp();
-    if ts >= 0 {
-        Some(UNIX_EPOCH + Duration::from_secs(ts as u64))
-    } else {
-        Some(UNIX_EPOCH - Duration::from_secs((-ts) as u64))
-    }
-}
-
-fn format_system_time_local(st: SystemTime, off: Option<UtcOffset>) -> Option<String> {
-    let dur = st.duration_since(UNIX_EPOCH).ok()?;
-    let mut odt = time::OffsetDateTime::from_unix_timestamp(dur.as_secs() as i64).ok()?;
-    if let Some(o) = off {
-        odt = odt.to_offset(o);
-    }
-    Some(odt.format(DATE_FMT).ok()?)
-}
-
-// Фаззи по подпоследовательности
-fn fuzzy_score(hay: &str, needle: &str, case_sensitive: bool) -> Option<f32> {
-    if needle.is_empty() {
-        return Some(0.0);
-    }
-    let (h, n) = if case_sensitive {
-        (hay.to_string(), needle.to_string())
-    } else {
-        (hay.to_lowercase(), needle.to_lowercase())
-    };
-    let h_bytes = h.as_bytes();
-    let n_bytes = n.as_bytes();
-
-    let mut i = 0usize;
-    let mut j = 0usize;
-    let mut score = 0.0f32;
-
-    while i < h_bytes.len() && j < n_bytes.len() {
-        if h_bytes[i] == n_bytes[j] {
-            if i == 0 || !is_alnum(h_bytes[i - 1]) {
-                score += 1.5;
+            let modified_str = if entry.modified > 0 {
+                let st = UNIX_EPOCH + Duration::from_secs(entry.modified);
+                format_system_time(st).unwrap_or_default()
             } else {
-                score += 1.0;
-            }
-            j += 1;
-        }
-        i += 1;
-    }
+                String::new()
+            };
 
-    if j == n_bytes.len() {
-        let len = h_bytes.len().max(1) as f32;
-        Some(score / len)
-    } else {
-        None
-    }
+            Some(SearchResult {
+                name,
+                path,
+                size: entry.size,
+                modified: modified_str,
+                is_dir: entry.is_dir(),
+                score: Some(calculate_score(&name_lower, &q_lower)),
+            })
+        })
+        .collect();
+
+    results.par_sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+
+    results.truncate(max_results);
+    results
 }
 
-fn is_alnum(b: u8) -> bool {
-    (b'A'..=b'Z').contains(&b) || (b'a'..=b'z').contains(&b) || (b'0'..=b'9').contains(&b)
-}
+// ============ File Operations Commands ============
 
-// Область поиска (весь ПК — по умолчанию)
-fn roots_for_scope(filters: &FilterOptions) -> Vec<PathBuf> {
-    match filters.search_scope.as_deref() {
-        Some("custom") => {
-            let v: Vec<PathBuf> = filters
-                .include_paths
-                .iter()
-                .map(PathBuf::from)
-                .collect();
-            if v.is_empty() { all_roots_by_os() } else { v }
-        }
-        Some("cwd") => std::env::current_dir().ok().into_iter().collect(),
-        Some("home") => home_dir().into_iter().collect(),
-        _ => all_roots_by_os(), // покрывает Some("full"), None и любые другие строки
-    }
-}
+#[tauri::command]
+async fn open_file(path: String) -> Result<(), String> {
+    use std::process::Command;
 
-fn home_dir() -> Option<PathBuf> {
-    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-    {
-        dirs::home_dir()
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    {
-        None
-    }
-}
-
-fn all_roots_by_os() -> Vec<PathBuf> {
     #[cfg(target_os = "windows")]
     {
-        let mut roots = Vec::new();
-        for letter in b'A'..=b'Z' {
-            let drive = format!("{}:\\", letter as char);
-            let p = PathBuf::from(&drive);
-            if p.exists() {
-                roots.push(p);
-            }
-        }
-        if roots.is_empty() {
-            roots.push(PathBuf::from("C:\\"));
-        }
-        roots
+        Command::new("cmd")
+            .args(&["/C", "start", "", &path])
+            .spawn()
+            .map_err(|e| format!("Не удалось открыть файл: {}", e))?;
     }
-    #[cfg(not(target_os = "windows"))]
-    {
-        vec![PathBuf::from("/")]
-    }
+
+    Ok(())
 }
+
+#[tauri::command]
+async fn open_folder(path: String) -> Result<(), String> {
+    use std::process::Command;
+
+    let folder_path = if let Some(parent) = Path::new(&path).parent() {
+        parent.to_string_lossy().to_string()
+    } else {
+        path
+    };
+
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("explorer")
+            .arg(&folder_path)
+            .spawn()
+            .map_err(|e| format!("Не удалось открыть папку: {}", e))?;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn open_folder_and_select(path: String) -> Result<(), String> {
+    use std::process::Command;
+
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("explorer")
+            .args(&["/select,", &path])
+            .spawn()
+            .map_err(|e| format!("Не удалось открыть: {}", e))?;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn delete_file(path: String) -> Result<(), String> {
+    let p = Path::new(&path);
+
+    if p.is_dir() {
+        fs::remove_dir_all(p).map_err(|e| format!("Не удалось удалить папку: {}", e))?;
+    } else {
+        fs::remove_file(p).map_err(|e| format!("Не удалось удалить файл: {}", e))?;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn rename_file(old_path: String, new_name: String) -> Result<String, String> {
+    let old = Path::new(&old_path);
+    let parent = old.parent().ok_or("Невозможно получить родительскую папку")?;
+    let new_path = parent.join(&new_name);
+
+    fs::rename(old, &new_path).map_err(|e| format!("Не удалось переименовать: {}", e))?;
+
+    Ok(new_path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+async fn copy_path_to_clipboard(path: String) -> Result<(), String> {
+    use std::process::Command;
+
+    #[cfg(target_os = "windows")]
+    {
+        let powershell_cmd = format!("Set-Clipboard -Value '{}'", path.replace("'", "''"));
+        Command::new("powershell")
+            .args(&["-Command", &powershell_cmd])
+            .output()
+            .map_err(|e| format!("Не удалось скопировать путь: {}", e))?;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+fn get_file_properties(path: String) -> Result<StdHashMap<String, String>, String> {
+    let p = Path::new(&path);
+    let meta = fs::metadata(p).map_err(|e| format!("Не удалось получить информацию: {}", e))?;
+
+    let mut props = StdHashMap::new();
+    props.insert("size".to_string(), meta.len().to_string());
+    props.insert("is_dir".to_string(), meta.is_dir().to_string());
+    props.insert("is_file".to_string(), meta.is_file().to_string());
+    props.insert("readonly".to_string(), meta.permissions().readonly().to_string());
+
+    if let Ok(modified) = meta.modified() {
+        if let Ok(duration) = modified.duration_since(UNIX_EPOCH) {
+            props.insert("modified".to_string(), duration.as_secs().to_string());
+        }
+    }
+
+    Ok(props)
+}
+
+// ============ Utility Functions ============
+
+fn calculate_score(text: &str, query: &str) -> f32 {
+    if text == query {
+        return 100.0;
+    }
+    if text.starts_with(query) {
+        return 90.0;
+    }
+    let pos = text.find(query).unwrap_or(text.len());
+    let score = 50.0 - (pos as f32 / text.len() as f32) * 30.0;
+    score.max(10.0)
+}
+
+fn format_system_time(st: SystemTime) -> Option<String> {
+    const FMT: &[FormatItem<'static>] = format_description!("[year]-[month]-[day] [hour]:[minute]");
+    let dur = st.duration_since(UNIX_EPOCH).ok()?;
+    let odt = time::OffsetDateTime::from_unix_timestamp(dur.as_secs() as i64).ok()?;
+    Some(odt.format(FMT).ok()?)
+}
+
+// ============ Main ============
 
 fn main() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![search])
+        .invoke_handler(tauri::generate_handler![
+            get_available_drives,
+            start_indexing,
+            get_index_status,
+            search,
+            open_file,
+            open_folder,
+            open_folder_and_select,
+            delete_file,
+            rename_file,
+            copy_path_to_clipboard,
+            get_file_properties,
+        ])
         .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .expect("Failed to run application");
 }

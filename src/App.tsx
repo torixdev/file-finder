@@ -1,34 +1,15 @@
-import React, { useEffect, useMemo, useState } from "react";
+import {useEffect, useState, useRef, JSX} from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { Icons } from "./icons";
 import "./app.css";
-
-type SearchMode = "substring" | "regex" | "fuzzy";
-type SearchScope = "full" | "home" | "cwd" | "custom";
 
 type FilterOptions = {
     fileTypes: string[];
     minSize?: number | null;
     maxSize?: number | null;
-    modifiedFrom?: string | null;
-    modifiedTo?: string | null;
-    includePaths: string[];
-    excludePaths: string[];
-    searchMode: SearchMode;
-    caseSensitive: boolean;
-    searchInContent: boolean;
-    followSymlinks: boolean;
     includeHidden: boolean;
     maxResults: number;
-    searchScope: SearchScope;
-};
-
-type Settings = {
-    indexingEnabled: boolean;
-    indexLocation: string;
-    parallelism: number;
-    respectGitIgnore: boolean;
-    cacheTtlHours: number;
 };
 
 type SearchResult = {
@@ -40,45 +21,34 @@ type SearchResult = {
     score?: number | null;
 };
 
+type DriveInfo = {
+    letter: string;
+    driveType: string;
+    available: boolean;
+};
+
+type DriveProgress = {
+    letter: string;
+    scanned: number;
+    finished: boolean;
+    method: string;
+};
+
 type IndexState = {
     running: boolean;
-    roots: string[];
-    rootIndex: number;         // 0-based
-    currentRoot: string | null;
-    scanned: number;           // всего путей
-    files: number;
-    dirs: number;
-    currentPath: string | null;
+    drives: DriveProgress[];
+    totalScanned: number;
+    totalFiles: number;
+    totalDirs: number;
     elapsedMs: number;
-    finished?: boolean;
-    cancelled?: boolean;
-    error?: string | null;
+    finished: boolean;
 };
 
-const defaultFilters: FilterOptions = {
-    fileTypes: [],
-    minSize: null,
-    maxSize: null,
-    modifiedFrom: null,
-    modifiedTo: null,
-    includePaths: [],
-    excludePaths: [],
-    searchMode: "substring",
-    caseSensitive: false,
-    searchInContent: false,
-    followSymlinks: false,
-    includeHidden: true,
-    maxResults: 5000,
-    searchScope: "full",
-};
-
-const defaultSettings: Settings = {
-    indexingEnabled: true,
-    indexLocation: "",
-    parallelism: navigator.hardwareConcurrency || 4,
-    respectGitIgnore: true,
-    cacheTtlHours: 24,
-};
+type ContextMenu = {
+    x: number;
+    y: number;
+    item: SearchResult;
+} | null;
 
 function formatBytes(bytes: number) {
     if (bytes <= 0) return "—";
@@ -88,218 +58,364 @@ function formatBytes(bytes: number) {
     return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
 }
 
-function extFromName(name: string): string {
-    const idx = name.lastIndexOf(".");
-    if (idx < 0) return "";
-    return name.slice(idx + 1).toLowerCase();
+function formatNumber(n: number) {
+    return n.toLocaleString("ru-RU");
 }
 
-function iconFor(result: SearchResult): { name: string; colorClass: string } {
-    if (result.isDir) return { name: "folder", colorClass: "c-folder" };
-    const ext = extFromName(result.name);
-    if (["pdf"].includes(ext)) return { name: "picture_as_pdf", colorClass: "c-pdf" };
-    if (["txt", "md", "log", "rtf"].includes(ext)) return { name: "description", colorClass: "c-text" };
-    if (["png", "jpg", "jpeg", "gif", "bmp", "webp", "svg"].includes(ext)) return { name: "image", colorClass: "c-image" };
-    if (["mp4", "mkv", "mov", "avi", "webm"].includes(ext)) return { name: "movie", colorClass: "c-video" };
-    if (["mp3", "wav", "flac", "ogg", "m4a"].includes(ext)) return { name: "audio_file", colorClass: "c-audio" };
-    if (["zip", "rar", "7z", "tar", "gz", "bz2"].includes(ext)) return { name: "folder_zip", colorClass: "c-archive" };
-    if (["json", "yaml", "yml", "toml", "csv"].includes(ext)) return { name: "table", colorClass: "c-data" };
-    if (["rs", "ts", "tsx", "js", "jsx", "go", "py", "java", "kt", "c", "h", "cpp", "cs", "php", "rb", "swift"].includes(ext))
-        return { name: "code", colorClass: "c-code" };
-    return { name: "insert_drive_file", colorClass: "c-default" };
+function iconFor(result: SearchResult): { icon: JSX.Element; colorClass: string } {
+    if (result.isDir) return { icon: Icons.folder, colorClass: "c-folder" };
+    const ext = result.name.split(".").pop()?.toLowerCase() || "";
+    if (["pdf"].includes(ext)) return { icon: Icons.pdf, colorClass: "c-pdf" };
+    if (["txt", "md", "log"].includes(ext)) return { icon: Icons.description, colorClass: "c-text" };
+    if (["png", "jpg", "jpeg", "gif", "webp", "svg"].includes(ext)) return { icon: Icons.image, colorClass: "c-image" };
+    if (["mp4", "mkv", "mov", "avi"].includes(ext)) return { icon: Icons.video, colorClass: "c-video" };
+    if (["mp3", "wav", "flac", "ogg"].includes(ext)) return { icon: Icons.audio, colorClass: "c-audio" };
+    if (["zip", "rar", "7z", "tar", "gz"].includes(ext)) return { icon: Icons.archive, colorClass: "c-archive" };
+    if (["rs", "ts", "tsx", "js", "jsx", "py", "java", "cpp", "c", "go"].includes(ext)) return { icon: Icons.code, colorClass: "c-code" };
+    return { icon: Icons.file, colorClass: "c-default" };
 }
 
 export default function App() {
     const [query, setQuery] = useState("");
-    const [filters, setFilters] = useState<FilterOptions>(defaultFilters);
-    const [settings, setSettings] = useState<Settings>(defaultSettings);
+    const [filters, setFilters] = useState<FilterOptions>({
+        fileTypes: [],
+        minSize: null,
+        maxSize: null,
+        includeHidden: false,
+        maxResults: 1000,
+    });
 
-    const [isSearching, setIsSearching] = useState(false);
-    const [elapsed, setElapsed] = useState(0);
-    const [results, setResults] = useState<SearchResult[]>([]);
-    const [error, setError] = useState<string | null>(null);
+    const [availableDrives, setAvailableDrives] = useState<DriveInfo[]>([]);
+    const [selectedDrives, setSelectedDrives] = useState<string[]>([]);
+    const [showDriveSelector, setShowDriveSelector] = useState(false);
 
-    const [showFilters, setShowFilters] = useState(false);
-    const [showSettings, setShowSettings] = useState(false);
-
-    // Индексация (состояние из backend через события)
     const [indexState, setIndexState] = useState<IndexState | null>(null);
+    const [isSearching, setIsSearching] = useState(false);
+    const [results, setResults] = useState<SearchResult[]>([]);
+
+    const [contextMenu, setContextMenu] = useState<ContextMenu>(null);
+    const [renameItem, setRenameItem] = useState<SearchResult | null>(null);
+    const [newName, setNewName] = useState("");
+
+    const contextMenuRef = useRef<HTMLDivElement>(null);
 
     useEffect(() => {
-        let unlisten: null | (() => void) = null;
-        (async () => {
-            try {
-                unlisten = await listen<IndexState>("index:state", (e) => {
-                    setIndexState(e.payload);
-                });
-                // запросим статус при монтировании
-                const s = (await invoke("get_index_status")) as IndexState | null;
-                if (s) setIndexState(s);
-                // автозапуск индексации при включенных настройках
-                if (settings.indexingEnabled) {
-                    await startIndexing();
-                }
-            } catch (e) {
-                console.warn("index event bind error", e);
+        const handleContextMenu = (e: MouseEvent) => {
+            const target = e.target as HTMLElement;
+            if (!target.closest(".custom-context-menu")) {
+                e.preventDefault();
             }
-        })();
-        return () => { if (unlisten) unlisten(); };
-        // eslint-disable-next-line react-hooks/exhaustive-deps
+        };
+        document.addEventListener("contextmenu", handleContextMenu);
+
+        invoke<DriveInfo[]>("get_available_drives").then((drives) => {
+            setAvailableDrives(drives);
+            setSelectedDrives(drives.map((d) => d.letter));
+            setShowDriveSelector(true);
+        });
+
+        const unlisten = listen<IndexState>("index:state", (event) => {
+            setIndexState(event.payload);
+        });
+
+        return () => {
+            document.removeEventListener("contextmenu", handleContextMenu);
+            unlisten.then((fn) => fn());
+        };
     }, []);
 
-    const statusText = useMemo(() => {
-        if (isSearching) return "Поиск…";
-        if (error) return "Ошибка";
-        const t = elapsed > 0 ? ` за ${Math.max(1, Math.round(elapsed))} мс` : "";
-        return `${results.length} результатов${t}`;
-    }, [isSearching, results.length, error, elapsed]);
+    useEffect(() => {
+        const handleClick = () => setContextMenu(null);
+        document.addEventListener("click", handleClick);
+        return () => document.removeEventListener("click", handleClick);
+    }, []);
+
+    useEffect(() => {
+        if (contextMenu && contextMenuRef.current) {
+            const menu = contextMenuRef.current;
+            const menuRect = menu.getBoundingClientRect();
+            const windowWidth = window.innerWidth;
+            const windowHeight = window.innerHeight;
+
+            let adjustedX = contextMenu.x;
+            let adjustedY = contextMenu.y;
+
+            if (contextMenu.x + menuRect.width > windowWidth) {
+                adjustedX = windowWidth - menuRect.width - 10;
+            }
+
+            if (contextMenu.y + menuRect.height > windowHeight) {
+                adjustedY = contextMenu.y - menuRect.height;
+                if (adjustedY < 0) {
+                    adjustedY = 10;
+                }
+            }
+
+            if (adjustedX < 0) {
+                adjustedX = 10;
+            }
+
+            if (adjustedY < 0) {
+                adjustedY = 10;
+            }
+
+            if (adjustedX !== contextMenu.x || adjustedY !== contextMenu.y) {
+                menu.style.left = `${adjustedX}px`;
+                menu.style.top = `${adjustedY}px`;
+            }
+        }
+    }, [contextMenu]);
+
+    async function handleStartIndexing() {
+        if (selectedDrives.length === 0) {
+            alert("Выберите хотя бы один диск!");
+            return;
+        }
+
+        setShowDriveSelector(false);
+        await invoke("start_indexing", { selectedDrives: selectedDrives.map((s) => s.charAt(0)) });
+    }
 
     async function handleSearch() {
         setIsSearching(true);
-        setError(null);
-        setResults([]);
-        setElapsed(0);
         try {
-            const payload = {
-                ...filters,
-                fileTypes: filters.fileTypes.map((x) => x.trim()).filter(Boolean),
-                includePaths: filters.includePaths.map((x) => x.trim()).filter(Boolean),
-                excludePaths: filters.excludePaths.map((x) => x.trim()).filter(Boolean),
-                minSize: filters.minSize || null,
-                maxSize: filters.maxSize || null,
-                modifiedFrom: filters.modifiedFrom || null,
-                modifiedTo: filters.modifiedTo || null,
-            };
-            const t0 = performance.now();
-            const res = (await invoke("search", { query: query.trim(), filters: payload })) as SearchResult[];
-            const t1 = performance.now();
-            setElapsed(t1 - t0);
+            const res = await invoke<SearchResult[]>("search", {
+                query: query.trim(),
+                filters: {
+                    ...filters,
+                    fileTypes: filters.fileTypes.map((x) => x.trim()).filter(Boolean),
+                },
+            });
             setResults(res || []);
-        } catch (e: any) {
+        } catch (e) {
             console.error(e);
-            setError(e?.message || "Не удалось выполнить поиск");
         } finally {
             setIsSearching(false);
         }
     }
 
-    function onEnter(e: React.KeyboardEvent<HTMLInputElement>) {
-        if (e.key === "Enter") handleSearch();
-    }
-    function resetFilters() {
-        setFilters(defaultFilters);
-    }
+    const toggleDrive = (letter: string) => {
+        setSelectedDrives((prev) => (prev.includes(letter) ? prev.filter((d) => d !== letter) : [...prev, letter]));
+    };
 
-    async function startIndexing() {
+    const handleRowClick = async (item: SearchResult) => {
         try {
-            await invoke("start_indexing", {
-                filters: {
-                    ...filters,
-                    fileTypes: filters.fileTypes.map((x) => x.trim()).filter(Boolean),
-                    includePaths: filters.includePaths.map((x) => x.trim()).filter(Boolean),
-                    excludePaths: filters.excludePaths.map((x) => x.trim()).filter(Boolean),
-                },
-            });
+            await invoke("open_file", { path: item.path });
         } catch (e) {
-            console.error("start_indexing error", e);
+            console.error(e);
+            alert(`Не удалось открыть: ${e}`);
         }
-    }
-    async function cancelIndexing() {
-        try { await invoke("cancel_indexing"); } catch (e) { console.error(e); }
-    }
+    };
 
-    const roots = indexState?.roots || [];
-    const rootIndex = indexState?.rootIndex ?? 0;
-    const rootPercent = roots.length > 0 ? Math.round((rootIndex / roots.length) * 100) : 0;
+    const handleRowContextMenu = (e: React.MouseEvent, item: SearchResult) => {
+        e.preventDefault();
+        e.stopPropagation();
+
+        setContextMenu({
+            x: e.clientX,
+            y: e.clientY,
+            item,
+        });
+    };
+
+    const handleOpenFile = async () => {
+        if (!contextMenu) return;
+        try {
+            await invoke("open_file", { path: contextMenu.item.path });
+            setContextMenu(null);
+        } catch (e) {
+            alert(`Ошибка: ${e}`);
+        }
+    };
+
+    const handleOpenFolder = async () => {
+        if (!contextMenu) return;
+        try {
+            await invoke("open_folder", { path: contextMenu.item.path });
+            setContextMenu(null);
+        } catch (e) {
+            alert(`Ошибка: ${e}`);
+        }
+    };
+
+    const handleOpenFolderAndSelect = async () => {
+        if (!contextMenu) return;
+        try {
+            await invoke("open_folder_and_select", { path: contextMenu.item.path });
+            setContextMenu(null);
+        } catch (e) {
+            alert(`Ошибка: ${e}`);
+        }
+    };
+
+    const handleDelete = async () => {
+        if (!contextMenu) return;
+        const confirmed = confirm(`Вы уверены, что хотите удалить "${contextMenu.item.name}"?`);
+        if (!confirmed) return;
+
+        try {
+            await invoke("delete_file", { path: contextMenu.item.path });
+            setResults((prev) => prev.filter((r) => r.path !== contextMenu.item.path));
+            setContextMenu(null);
+        } catch (e) {
+            alert(`Ошибка удаления: ${e}`);
+        }
+    };
+
+    const handleRenameStart = () => {
+        if (!contextMenu) return;
+        setRenameItem(contextMenu.item);
+        setNewName(contextMenu.item.name);
+        setContextMenu(null);
+    };
+
+    const handleRenameSubmit = async () => {
+        if (!renameItem || !newName.trim()) return;
+
+        try {
+            const newPath = await invoke<string>("rename_file", {
+                oldPath: renameItem.path,
+                newName: newName.trim(),
+            });
+
+            setResults((prev) =>
+                prev.map((r) =>
+                    r.path === renameItem.path
+                        ? {
+                            ...r,
+                            name: newName.trim(),
+                            path: newPath,
+                        }
+                        : r
+                )
+            );
+            setRenameItem(null);
+            setNewName("");
+        } catch (e) {
+            alert(`Ошибка переименования: ${e}`);
+        }
+    };
+
+    const handleCopyPath = async () => {
+        if (!contextMenu) return;
+        try {
+            await invoke("copy_path_to_clipboard", { path: contextMenu.item.path });
+            setContextMenu(null);
+        } catch (e) {
+            alert(`Ошибка копирования: ${e}`);
+        }
+    };
+
+    const statusLine = indexState?.running
+        ? `Сканирование ${indexState.drives.filter((d) => !d.finished).length} дисков — ${formatNumber(indexState.totalFiles)} файлов, ${formatNumber(indexState.totalDirs)} папок`
+        : indexState?.finished
+            ? `Готово за ${(indexState.elapsedMs / 1000).toFixed(1)}с — ${formatNumber(indexState.totalFiles)} файлов`
+            : "Выберите диски для сканирования";
 
     return (
         <div className="wrap">
-            <header className="topbar">
-                <div className="brand">
-                    <span className="logo-dot" />
-                    FileFinder
-                </div>
-                <div className="actions">
-                    {indexState?.running ? (
-                        <button className="btn" onClick={cancelIndexing}>
-                            <span className="spinner" /> Сканируется: {indexState?.currentRoot || "—"}
-                        </button>
-                    ) : (
-                        <button className="btn ghost" onClick={startIndexing}>
-                            <span className="ms">data_usage</span> Сканировать диски
-                        </button>
-                    )}
-                    <button className="btn ghost" onClick={() => setShowFilters((v) => !v)}>
-                        <span className="ms">tune</span> Фильтры
-                    </button>
-                    <button className="btn ghost" onClick={() => setShowSettings(true)}>
-                        <span className="ms">settings</span> Настройки
-                    </button>
-                </div>
-            </header>
-
-            <section className="search-panel">
-                <div className="searchbar">
-                    <span className="ms leading">search</span>
-                    <input
-                        placeholder="Поиск по имени файла…"
-                        value={query}
-                        onChange={(e) => setQuery(e.target.value)}
-                        onKeyDown={onEnter}
-                    />
-                    <button className="btn primary" onClick={handleSearch} disabled={isSearching}>
-                        Найти
-                    </button>
-                </div>
-
-                {/* Баннер индексации */}
-                {indexState?.running && (
-                    <div className="index-banner">
-                        <div className="index-row">
-                            <div className="index-info">
-                                <span className="ms leading">bolt</span>
-                                <div>
-                                    <div className="muted">Идёт сканирование дисков</div>
-                                    <div><b>{indexState.currentRoot || "—"}</b></div>
-                                </div>
-                            </div>
-                            <div className="drives">
-                                {roots.map((r, i) => (
-                                    <span key={r} className={`chip ${i < rootIndex ? "done" : ""} ${i === rootIndex ? "active" : ""}`}>
-                    <span className="dot" /> {r}
-                  </span>
-                                ))}
-                            </div>
+            {showDriveSelector && (
+                <div className="modal-backdrop fade-in">
+                    <div className="modal drive-selector slide-in">
+                        <h2>Выберите диски для индексации</h2>
+                        <div className="drive-list">
+                            {availableDrives.map((drive, idx) => (
+                                <label key={drive.letter} className="drive-item" style={{ animationDelay: `${idx * 0.05}s` }}>
+                                    <input type="checkbox" checked={selectedDrives.includes(drive.letter)} onChange={() => toggleDrive(drive.letter)} />
+                                    <span className="icon-wrapper">{Icons.storage}</span>
+                                    <div className="drive-info">
+                                        <strong>Диск {drive.letter}</strong>
+                                        <span className="muted">{drive.driveType}</span>
+                                    </div>
+                                </label>
+                            ))}
                         </div>
-                        <div className="progress">
-                            <div className="bar" style={{ ["--value" as any]: `${rootPercent}%` }} />
-                        </div>
-                        <div className="index-row">
-                            <div className="kv">
-                                <span><b>{indexState.files.toLocaleString()}</b> файлов</span>
-                                <span><b>{indexState.dirs.toLocaleString()}</b> папок</span>
-                                <span className="muted" title={indexState.currentPath || ""}>
-                  {indexState.currentPath || "…"}
-                </span>
-                            </div>
-                            <div className="progress marquee" style={{ width: 220 }}>
-                                <div className="bar" />
-                            </div>
+                        <div className="actions">
+                            <button className="btn primary" onClick={handleStartIndexing} disabled={selectedDrives.length === 0}>
+                                Начать сканирование ({selectedDrives.length})
+                            </button>
                         </div>
                     </div>
+                </div>
+            )}
+
+            <header className="topbar slide-down">
+                <div className="brand">
+                    <span className="logo-dot pulse" />
+                    FileFinder
+                </div>
+                <div className="status-line">{statusLine}</div>
+                {indexState?.finished && (
+                    <button className="btn ghost" onClick={() => setShowDriveSelector(true)}>
+                        <span className="icon-wrapper">{Icons.refresh}</span>
+                        Пересканировать
+                    </button>
                 )}
+            </header>
+
+            {indexState?.running && (
+                <section className="progress-panel fade-in">
+                    {indexState.drives.map((drive, idx) => (
+                        <div key={drive.letter} className={`drive-progress ${drive.finished ? "finished" : ""}`} style={{ animationDelay: `${idx * 0.1}s` }}>
+                            <div className="drive-header">
+                                <span className="icon-wrapper">{Icons.storage}</span>
+                                <strong>Диск {drive.letter}</strong>
+                                <span className="method">{drive.method}</span>
+                            </div>
+                            <div className="drive-stats">
+                                {drive.finished ? (
+                                    <span className="done">✓ {formatNumber(drive.scanned)}</span>
+                                ) : (
+                                    <span className="scanning">
+                                        <span className="spinner-sm" />
+                                        {formatNumber(drive.scanned)}
+                                    </span>
+                                )}
+                            </div>
+                        </div>
+                    ))}
+                </section>
+            )}
+
+            <section className="search-panel fade-in-up">
+                <div className="searchbar">
+                    <span className="icon-leading">{Icons.search}</span>
+                    <input
+                        type="text"
+                        placeholder="Поиск файлов..."
+                        value={query}
+                        onChange={(e) => setQuery(e.target.value)}
+                        onKeyDown={(e) => e.key === "Enter" && handleSearch()}
+                        disabled={indexState?.running || !indexState?.finished}
+                    />
+                    <button className="btn primary" onClick={handleSearch} disabled={isSearching || indexState?.running || !indexState?.finished}>
+                        {isSearching ? (
+                            <>
+                                <span className="spinner" /> Поиск...
+                            </>
+                        ) : (
+                            "Найти"
+                        )}
+                    </button>
+                </div>
+
+                <div className="quick-filters">
+                    <input
+                        type="text"
+                        placeholder="Фильтр по расширению (pdf, txt, rs)"
+                        value={filters.fileTypes.join(", ")}
+                        onChange={(e) => setFilters((f) => ({ ...f, fileTypes: e.target.value.split(",") }))}
+                    />
+                    <label>
+                        <input type="checkbox" checked={filters.includeHidden} onChange={(e) => setFilters((f) => ({ ...f, includeHidden: e.target.checked }))} />
+                        Показать скрытые
+                    </label>
+                </div>
             </section>
 
-            <section className="results">
+            <section className="results fade-in-up" style={{ animationDelay: "0.1s" }}>
                 <div className="status">
-                    <span className="muted">{statusText}</span>
-                    {indexState?.finished && !indexState?.running && (
-                        <span className="pill ok">Индекс готов</span>
-                    )}
-                    {indexState?.cancelled && (
-                        <span className="pill warn">Индексация отменена</span>
-                    )}
-                    {error && <span className="error">⚠ {error}</span>}
+                    <span className="muted">{results.length} результатов</span>
                 </div>
 
                 <table>
@@ -310,39 +426,37 @@ export default function App() {
                         <th>Путь</th>
                         <th>Размер</th>
                         <th>Изменён</th>
-                        <th>Тип</th>
                     </tr>
                     </thead>
                     <tbody>
-                    {isSearching && Array.from({ length: 8 }).map((_, i) => (
-                        <tr key={`skel-${i}`}>
-                            <td><span className="skel" style={{ display: "inline-block", width: 26, height: 26 }} /></td>
-                            <td><div className="skel" style={{ height: 16, width: "60%" }} /></td>
-                            <td><div className="skel" style={{ height: 16, width: "80%" }} /></td>
-                            <td><div className="skel" style={{ height: 16, width: 60 }} /></td>
-                            <td><div className="skel" style={{ height: 16, width: 100 }} /></td>
-                            <td><div className="skel" style={{ height: 16, width: 70 }} /></td>
-                        </tr>
-                    ))}
-
-                    {results.length === 0 && !isSearching && !error && (
+                    {results.length === 0 && !isSearching && (
                         <tr>
-                            <td colSpan={6} className="empty">Ничего не найдено</td>
+                            <td colSpan={5} className="empty">
+                                {indexState?.finished ? "Ничего не найдено" : "Дождитесь завершения индексации"}
+                            </td>
                         </tr>
                     )}
-
                     {results.map((r, i) => {
                         const ic = iconFor(r);
                         return (
-                            <tr key={i}>
+                            <tr
+                                key={i}
+                                className="table-row-anim"
+                                style={{ animationDelay: `${i * 0.02}s` }}
+                                onClick={() => handleRowClick(r)}
+                                onContextMenu={(e) => handleRowContextMenu(e, r)}
+                            >
                                 <td className="icon-cell">
-                                    <span className={`ms icon ${ic.colorClass}`}>{ic.name}</span>
+                                    <span className={`icon ${ic.colorClass}`}>{ic.icon}</span>
                                 </td>
-                                <td className="name" title={r.name}>{r.name}</td>
-                                <td className="path monospace" title={r.path}>{r.path}</td>
+                                <td className="name" title={r.name}>
+                                    {r.name}
+                                </td>
+                                <td className="path monospace" title={r.path}>
+                                    {r.path}
+                                </td>
                                 <td>{r.isDir ? "—" : formatBytes(r.size)}</td>
                                 <td>{r.modified || "—"}</td>
-                                <td>{r.isDir ? "Папка" : "Файл"}</td>
                             </tr>
                         );
                     })}
@@ -350,83 +464,67 @@ export default function App() {
                 </table>
             </section>
 
-            {showSettings && (
-                <SettingsModal
-                    settings={settings}
-                    onClose={() => setShowSettings(false)}
-                    onSave={(s) => {
-                        setSettings(s);
-                        if (s.indexingEnabled && !indexState?.running) startIndexing();
+            {contextMenu && (
+                <div
+                    ref={contextMenuRef}
+                    className="custom-context-menu"
+                    style={{
+                        left: `${contextMenu.x}px`,
+                        top: `${contextMenu.y}px`,
                     }}
-                />
+                    onClick={(e) => e.stopPropagation()}
+                >
+                    <div className="context-item" onClick={handleOpenFile}>
+                        <span className="icon-wrapper">{Icons.openInNew}</span>
+                        Открыть
+                    </div>
+                    <div className="context-item" onClick={handleOpenFolderAndSelect}>
+                        <span className="icon-wrapper">{Icons.folderOpen}</span>
+                        Показать в папке
+                    </div>
+                    <div className="context-item" onClick={handleOpenFolder}>
+                        <span className="icon-wrapper">{Icons.driveFileMove}</span>
+                        Открыть папку
+                    </div>
+                    <div className="context-divider"></div>
+                    <div className="context-item" onClick={handleRenameStart}>
+                        <span className="icon-wrapper">{Icons.edit}</span>
+                        Переименовать
+                    </div>
+                    <div className="context-item" onClick={handleCopyPath}>
+                        <span className="icon-wrapper">{Icons.contentCopy}</span>
+                        Копировать путь
+                    </div>
+                    <div className="context-divider"></div>
+                    <div className="context-item danger" onClick={handleDelete}>
+                        <span className="icon-wrapper">{Icons.delete}</span>
+                        Удалить
+                    </div>
+                </div>
             )}
-        </div>
-    );
-}
 
-function SettingsModal({
-                           settings, onClose, onSave,
-                       }: { settings: Settings; onClose: () => void; onSave: (s: Settings) => void; }) {
-    const [local, setLocal] = useState<Settings>(settings);
-    function save() { onSave(local); onClose(); }
-    return (
-        <div className="modal-backdrop" onClick={onClose}>
-            <div className="modal" onClick={(e) => e.stopPropagation()}>
-                <h3>Настройки</h3>
-
-                <label className="rowH">
-                    <input
-                        type="checkbox"
-                        checked={local.indexingEnabled}
-                        onChange={(e) => setLocal((s) => ({ ...s, indexingEnabled: e.target.checked }))}
-                    />
-                    <span>Включить индексирование</span>
-                </label>
-
-                <label>
-                    Каталог индекса
-                    <input
-                        placeholder="/var/tmp/filefinder-index"
-                        value={local.indexLocation}
-                        onChange={(e) => setLocal((s) => ({ ...s, indexLocation: e.target.value }))}
-                    />
-                </label>
-
-                <div className="row">
-                    <label>
-                        Параллелизм
+            {renameItem && (
+                <div className="modal-backdrop fade-in" onClick={() => setRenameItem(null)}>
+                    <div className="modal rename-modal slide-in" onClick={(e) => e.stopPropagation()}>
+                        <h3>Переименовать</h3>
                         <input
-                            type="number"
-                            min={1}
-                            value={local.parallelism}
-                            onChange={(e) => setLocal((s) => ({ ...s, parallelism: Number(e.target.value || 1) }))}
+                            type="text"
+                            value={newName}
+                            onChange={(e) => setNewName(e.target.value)}
+                            onKeyDown={(e) => e.key === "Enter" && handleRenameSubmit()}
+                            autoFocus
                         />
-                    </label>
-                    <label>
-                        TTL кэша (ч)
-                        <input
-                            type="number"
-                            min={1}
-                            value={local.cacheTtlHours}
-                            onChange={(e) => setLocal((s) => ({ ...s, cacheTtlHours: Number(e.target.value || 1) }))}
-                        />
-                    </label>
+                        <div className="actions">
+                            <button className="btn" onClick={() => setRenameItem(null)}>
+                                Отмена
+                            </button>
+                            <button className="btn primary" onClick={handleRenameSubmit} disabled={!newName.trim()}>
+                                Переименовать
+                            </button>
+                        </div>
+                    </div>
                 </div>
-
-                <label className="rowH">
-                    <input
-                        type="checkbox"
-                        checked={local.respectGitIgnore}
-                        onChange={(e) => setLocal((s) => ({ ...s, respectGitIgnore: e.target.checked }))}
-                    />
-                    <span>Учитывать .gitignore</span>
-                </label>
-
-                <div className="actions">
-                    <button className="btn" onClick={onClose}>Отмена</button>
-                    <button className="btn primary" onClick={save}>Сохранить</button>
-                </div>
-            </div>
+            )}
         </div>
     );
 }
