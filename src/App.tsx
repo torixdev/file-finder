@@ -98,6 +98,7 @@ export default function App() {
     const [newName, setNewName] = useState("");
 
     const contextMenuRef = useRef<HTMLDivElement>(null);
+    const searchInputRef = useRef<HTMLInputElement>(null);
 
     useEffect(() => {
         const handleContextMenu = (e: MouseEvent) => {
@@ -118,8 +119,17 @@ export default function App() {
             setIndexState(event.payload);
         });
 
+        const handleKeyDown = (e: KeyboardEvent) => {
+            if ((e.ctrlKey || e.metaKey) && e.key === "k") {
+                e.preventDefault();
+                searchInputRef.current?.focus();
+            }
+        };
+        document.addEventListener("keydown", handleKeyDown);
+
         return () => {
             document.removeEventListener("contextmenu", handleContextMenu);
+            document.removeEventListener("keydown", handleKeyDown);
             unlisten.then((fn) => fn());
         };
     }, []);
@@ -146,29 +156,20 @@ export default function App() {
 
             if (contextMenu.y + menuRect.height > windowHeight) {
                 adjustedY = contextMenu.y - menuRect.height;
-                if (adjustedY < 0) {
-                    adjustedY = 10;
-                }
+                if (adjustedY < 0) adjustedY = 10;
             }
 
-            if (adjustedX < 0) {
-                adjustedX = 10;
-            }
+            if (adjustedX < 0) adjustedX = 10;
+            if (adjustedY < 0) adjustedY = 10;
 
-            if (adjustedY < 0) {
-                adjustedY = 10;
-            }
-
-            if (adjustedX !== contextMenu.x || adjustedY !== contextMenu.y) {
-                menu.style.left = `${adjustedX}px`;
-                menu.style.top = `${adjustedY}px`;
-            }
+            menu.style.left = `${adjustedX}px`;
+            menu.style.top = `${adjustedY}px`;
         }
     }, [contextMenu]);
 
     async function handleStartIndexing() {
         if (selectedDrives.length === 0) {
-            alert("Выберите хотя бы один диск!");
+            alert("Выберите хотя бы один диск");
             return;
         }
 
@@ -177,6 +178,8 @@ export default function App() {
     }
 
     async function handleSearch() {
+        if (!query.trim()) return;
+
         setIsSearching(true);
         try {
             const res = await invoke<SearchResult[]>("search", {
@@ -203,19 +206,13 @@ export default function App() {
             await invoke("open_file", { path: item.path });
         } catch (e) {
             console.error(e);
-            alert(`Не удалось открыть: ${e}`);
         }
     };
 
     const handleRowContextMenu = (e: React.MouseEvent, item: SearchResult) => {
         e.preventDefault();
         e.stopPropagation();
-
-        setContextMenu({
-            x: e.clientX,
-            y: e.clientY,
-            item,
-        });
+        setContextMenu({ x: e.clientX, y: e.clientY, item });
     };
 
     const handleOpenFile = async () => {
@@ -224,7 +221,7 @@ export default function App() {
             await invoke("open_file", { path: contextMenu.item.path });
             setContextMenu(null);
         } catch (e) {
-            alert(`Ошибка: ${e}`);
+            console.error(e);
         }
     };
 
@@ -234,7 +231,7 @@ export default function App() {
             await invoke("open_folder", { path: contextMenu.item.path });
             setContextMenu(null);
         } catch (e) {
-            alert(`Ошибка: ${e}`);
+            console.error(e);
         }
     };
 
@@ -244,21 +241,20 @@ export default function App() {
             await invoke("open_folder_and_select", { path: contextMenu.item.path });
             setContextMenu(null);
         } catch (e) {
-            alert(`Ошибка: ${e}`);
+            console.error(e);
         }
     };
 
     const handleDelete = async () => {
         if (!contextMenu) return;
-        const confirmed = confirm(`Вы уверены, что хотите удалить "${contextMenu.item.name}"?`);
-        if (!confirmed) return;
+        if (!confirm(`Удалить "${contextMenu.item.name}"?`)) return;
 
         try {
             await invoke("delete_file", { path: contextMenu.item.path });
             setResults((prev) => prev.filter((r) => r.path !== contextMenu.item.path));
             setContextMenu(null);
         } catch (e) {
-            alert(`Ошибка удаления: ${e}`);
+            console.error(e);
         }
     };
 
@@ -281,18 +277,14 @@ export default function App() {
             setResults((prev) =>
                 prev.map((r) =>
                     r.path === renameItem.path
-                        ? {
-                            ...r,
-                            name: newName.trim(),
-                            path: newPath,
-                        }
+                        ? { ...r, name: newName.trim(), path: newPath }
                         : r
                 )
             );
             setRenameItem(null);
             setNewName("");
         } catch (e) {
-            alert(`Ошибка переименования: ${e}`);
+            console.error(e);
         }
     };
 
@@ -302,15 +294,15 @@ export default function App() {
             await invoke("copy_path_to_clipboard", { path: contextMenu.item.path });
             setContextMenu(null);
         } catch (e) {
-            alert(`Ошибка копирования: ${e}`);
+            console.error(e);
         }
     };
 
     const statusLine = indexState?.running
-        ? `Сканирование ${indexState.drives.filter((d) => !d.finished).length} дисков — ${formatNumber(indexState.totalFiles)} файлов, ${formatNumber(indexState.totalDirs)} папок`
+        ? `Сканирование • ${formatNumber(indexState.totalFiles)} файлов • ${formatNumber(indexState.totalDirs)} папок`
         : indexState?.finished
-            ? `Готово за ${(indexState.elapsedMs / 1000).toFixed(1)}с — ${formatNumber(indexState.totalFiles)} файлов`
-            : "Выберите диски для сканирования";
+            ? `${formatNumber(indexState.totalFiles)} файлов проиндексировано за ${(indexState.elapsedMs / 1000).toFixed(1)}с`
+            : "Выберите диски для индексации";
 
     return (
         <div className="wrap">
@@ -320,8 +312,16 @@ export default function App() {
                         <h2>Выберите диски для индексации</h2>
                         <div className="drive-list">
                             {availableDrives.map((drive, idx) => (
-                                <label key={drive.letter} className="drive-item" style={{ animationDelay: `${idx * 0.05}s` }}>
-                                    <input type="checkbox" checked={selectedDrives.includes(drive.letter)} onChange={() => toggleDrive(drive.letter)} />
+                                <label
+                                    key={drive.letter}
+                                    className="drive-item"
+                                    style={{ "--delay": idx } as React.CSSProperties}
+                                >
+                                    <input
+                                        type="checkbox"
+                                        checked={selectedDrives.includes(drive.letter)}
+                                        onChange={() => toggleDrive(drive.letter)}
+                                    />
                                     <span className="icon-wrapper">{Icons.storage}</span>
                                     <div className="drive-info">
                                         <strong>Диск {drive.letter}</strong>
@@ -331,8 +331,12 @@ export default function App() {
                             ))}
                         </div>
                         <div className="actions">
-                            <button className="btn primary" onClick={handleStartIndexing} disabled={selectedDrives.length === 0}>
-                                Начать сканирование ({selectedDrives.length})
+                            <button
+                                className="btn primary"
+                                onClick={handleStartIndexing}
+                                disabled={selectedDrives.length === 0}
+                            >
+                                Начать сканирование
                             </button>
                         </div>
                     </div>
@@ -341,14 +345,14 @@ export default function App() {
 
             <header className="topbar slide-down">
                 <div className="brand">
-                    <span className="logo-dot pulse" />
+                    <span className="logo-dot" />
                     FileFinder
                 </div>
                 <div className="status-line">{statusLine}</div>
                 {indexState?.finished && (
                     <button className="btn ghost" onClick={() => setShowDriveSelector(true)}>
                         <span className="icon-wrapper">{Icons.refresh}</span>
-                        Пересканировать
+                        Переиндексировать
                     </button>
                 )}
             </header>
@@ -356,7 +360,11 @@ export default function App() {
             {indexState?.running && (
                 <section className="progress-panel fade-in">
                     {indexState.drives.map((drive, idx) => (
-                        <div key={drive.letter} className={`drive-progress ${drive.finished ? "finished" : ""}`} style={{ animationDelay: `${idx * 0.1}s` }}>
+                        <div
+                            key={drive.letter}
+                            className={`drive-progress ${drive.finished ? "finished" : ""}`}
+                            style={{ "--delay": idx } as React.CSSProperties}
+                        >
                             <div className="drive-header">
                                 <span className="icon-wrapper">{Icons.storage}</span>
                                 <strong>Диск {drive.letter}</strong>
@@ -364,7 +372,7 @@ export default function App() {
                             </div>
                             <div className="drive-stats">
                                 {drive.finished ? (
-                                    <span className="done">✓ {formatNumber(drive.scanned)}</span>
+                                    <span className="done">{formatNumber(drive.scanned)} файлов</span>
                                 ) : (
                                     <span className="scanning">
                                         <span className="spinner-sm" />
@@ -381,58 +389,65 @@ export default function App() {
                 <div className="searchbar">
                     <span className="icon-leading">{Icons.search}</span>
                     <input
+                        ref={searchInputRef}
                         type="text"
-                        placeholder="Поиск файлов..."
+                        placeholder="Поиск файлов и папок..."
                         value={query}
                         onChange={(e) => setQuery(e.target.value)}
                         onKeyDown={(e) => e.key === "Enter" && handleSearch()}
                         disabled={indexState?.running || !indexState?.finished}
                     />
-                    <button className="btn primary" onClick={handleSearch} disabled={isSearching || indexState?.running || !indexState?.finished}>
-                        {isSearching ? (
-                            <>
-                                <span className="spinner" /> Поиск...
-                            </>
-                        ) : (
-                            "Найти"
-                        )}
+                    <button
+                        className="btn primary"
+                        onClick={handleSearch}
+                        disabled={isSearching || indexState?.running || !indexState?.finished || !query.trim()}
+                    >
+                        {isSearching ? <><span className="spinner" />Поиск...</> : "Найти"}
                     </button>
                 </div>
 
                 <div className="quick-filters">
                     <input
                         type="text"
-                        placeholder="Фильтр по расширению (pdf, txt, rs)"
+                        placeholder="Расширения: pdf, txt, rs"
                         value={filters.fileTypes.join(", ")}
                         onChange={(e) => setFilters((f) => ({ ...f, fileTypes: e.target.value.split(",") }))}
                     />
                     <label>
-                        <input type="checkbox" checked={filters.includeHidden} onChange={(e) => setFilters((f) => ({ ...f, includeHidden: e.target.checked }))} />
+                        <input
+                            type="checkbox"
+                            checked={filters.includeHidden}
+                            onChange={(e) => setFilters((f) => ({ ...f, includeHidden: e.target.checked }))}
+                        />
                         Показать скрытые
                     </label>
                 </div>
             </section>
 
-            <section className="results fade-in-up" style={{ animationDelay: "0.1s" }}>
+            <section className="results fade-in-up">
                 <div className="status">
-                    <span className="muted">{results.length} результатов</span>
+                    {results.length > 0 ? `Найдено результатов: ${results.length}` : "Результаты поиска"}
                 </div>
 
                 <table>
                     <thead>
                     <tr>
-                        <th style={{ width: 36 }}></th>
+                        <th style={{ width: 48 }}></th>
                         <th>Имя</th>
                         <th>Путь</th>
-                        <th>Размер</th>
-                        <th>Изменён</th>
+                        <th style={{ width: 100 }}>Размер</th>
+                        <th style={{ width: 140 }}>Изменён</th>
                     </tr>
                     </thead>
                     <tbody>
                     {results.length === 0 && !isSearching && (
                         <tr>
                             <td colSpan={5} className="empty">
-                                {indexState?.finished ? "Ничего не найдено" : "Дождитесь завершения индексации"}
+                                {indexState?.finished
+                                    ? query.trim()
+                                        ? "Ничего не найдено"
+                                        : "Введите запрос для поиска"
+                                    : "Дождитесь завершения индексации"}
                             </td>
                         </tr>
                     )}
@@ -442,7 +457,7 @@ export default function App() {
                             <tr
                                 key={i}
                                 className="table-row-anim"
-                                style={{ animationDelay: `${i * 0.02}s` }}
+                                style={{ "--delay": Math.min(i, 20) } as React.CSSProperties}
                                 onClick={() => handleRowClick(r)}
                                 onContextMenu={(e) => handleRowContextMenu(e, r)}
                             >
@@ -452,11 +467,11 @@ export default function App() {
                                 <td className="name" title={r.name}>
                                     {r.name}
                                 </td>
-                                <td className="path monospace" title={r.path}>
+                                <td className="path" title={r.path}>
                                     {r.path}
                                 </td>
-                                <td>{r.isDir ? "—" : formatBytes(r.size)}</td>
-                                <td>{r.modified || "—"}</td>
+                                <td className="monospace">{r.isDir ? "—" : formatBytes(r.size)}</td>
+                                <td className="monospace">{r.modified || "—"}</td>
                             </tr>
                         );
                     })}
@@ -468,10 +483,7 @@ export default function App() {
                 <div
                     ref={contextMenuRef}
                     className="custom-context-menu"
-                    style={{
-                        left: `${contextMenu.x}px`,
-                        top: `${contextMenu.y}px`,
-                    }}
+                    style={{ left: `${contextMenu.x}px`, top: `${contextMenu.y}px` }}
                     onClick={(e) => e.stopPropagation()}
                 >
                     <div className="context-item" onClick={handleOpenFile}>
@@ -511,14 +523,21 @@ export default function App() {
                             type="text"
                             value={newName}
                             onChange={(e) => setNewName(e.target.value)}
-                            onKeyDown={(e) => e.key === "Enter" && handleRenameSubmit()}
+                            onKeyDown={(e) => {
+                                if (e.key === "Enter") handleRenameSubmit();
+                                if (e.key === "Escape") setRenameItem(null);
+                            }}
                             autoFocus
                         />
                         <div className="actions">
                             <button className="btn" onClick={() => setRenameItem(null)}>
                                 Отмена
                             </button>
-                            <button className="btn primary" onClick={handleRenameSubmit} disabled={!newName.trim()}>
+                            <button
+                                className="btn primary"
+                                onClick={handleRenameSubmit}
+                                disabled={!newName.trim()}
+                            >
                                 Переименовать
                             </button>
                         </div>

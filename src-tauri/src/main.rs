@@ -8,23 +8,21 @@ use std::{
     fs,
     mem,
     os::windows::ffi::OsStrExt,
-    path::{Path, PathBuf},
+    path::Path,
     ptr,
     slice,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
-    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use ahash::{AHashMap as HashMap, AHashSet as HashSet};
+use ahash::AHashMap as HashMap;
 use arc_swap::ArcSwap;
-use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
-use ignore::WalkBuilder;
+use memchr::memmem::Finder;
 use once_cell::sync::Lazy;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rayon::prelude::*;
 use tauri::Emitter;
 use time::{format_description::FormatItem, macros::format_description};
@@ -39,17 +37,19 @@ use winapi::{
         fileapi::{CreateFileW, GetDriveTypeW, OPEN_EXISTING},
         handleapi::{CloseHandle, INVALID_HANDLE_VALUE},
         ioapiset::DeviceIoControl,
-        winbase::{FILE_FLAG_BACKUP_SEMANTICS, DRIVE_FIXED, DRIVE_REMOVABLE},
-        winnt::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN, FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ},
+        winbase::{DRIVE_FIXED, DRIVE_REMOVABLE, FILE_FLAG_BACKUP_SEMANTICS},
+        winnt::{
+            FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            GENERIC_READ,
+        },
     },
 };
 
-// ============ Windows API Constants ============
-
 const FSCTL_ENUM_USN_DATA: DWORD = 0x000900b3;
 const FSCTL_QUERY_USN_JOURNAL: DWORD = 0x000900f4;
-
-// ============ Windows Structures ============
+const MFT_BUFFER_SIZE: usize = 16 * 1024 * 1024;
+const ROOT_FILE_REF: u64 = 0x0005_0000_0000_0005;
+const FILE_REF_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -60,7 +60,7 @@ struct MftEnumDataV0 {
 }
 
 #[repr(C)]
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone)]
 struct UsnJournalDataV0 {
     usn_journal_id: ULONGLONG,
     first_usn: LONGLONG,
@@ -72,7 +72,6 @@ struct UsnJournalDataV0 {
 }
 
 #[repr(C)]
-#[allow(dead_code)]
 struct UsnRecordV2 {
     record_length: DWORD,
     major_version: u16,
@@ -88,8 +87,6 @@ struct UsnRecordV2 {
     file_name_length: u16,
     file_name_offset: u16,
 }
-
-// ============ Data Structures ============
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -141,13 +138,23 @@ struct IndexState {
     finished: bool,
 }
 
-// ============ Compact Entry ============
+#[derive(Clone)]
+struct MftRawEntry {
+    file_ref: u64,
+    parent_ref: u64,
+    name: Box<str>,
+    is_dir: bool,
+    is_hidden: bool,
+    modified: u64,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Entry {
     name_off: u32,
     name_len: u16,
+    name_lower_off: u32,
+    name_lower_len: u16,
     path_off: u32,
     path_len: u32,
     size: u64,
@@ -156,141 +163,100 @@ struct Entry {
 }
 
 impl Entry {
-    #[inline]
+    #[inline(always)]
     fn is_dir(&self) -> bool {
         (self.flags & 0x01) != 0
     }
 
-    #[inline]
+    #[inline(always)]
     fn is_hidden(&self) -> bool {
         (self.flags & 0x02) != 0
     }
 }
 
-// ============ Fast Trie with String Interning ============
-
-#[derive(Default)]
-struct TrieNode {
-    children: HashMap<char, Box<TrieNode>>,
-    entry_ids: Vec<u32>,
-}
-
-impl TrieNode {
-    fn insert(&mut self, key: &str, id: u32) {
-        let mut node = self;
-        for ch in key.chars() {
-            node = node.children.entry(ch).or_insert_with(|| Box::new(TrieNode::default()));
-        }
-        node.entry_ids.push(id);
-    }
-
-    fn search_prefix(&self, prefix: &str) -> HashSet<u32> {
-        let mut node = self;
-        for ch in prefix.chars() {
-            match node.children.get(&ch) {
-                Some(n) => node = n,
-                None => return HashSet::default(),
-            }
-        }
-        let mut results = HashSet::default();
-        let mut stack = vec![node];
-        while let Some(n) = stack.pop() {
-            results.extend(&n.entry_ids);
-            for child in n.children.values() {
-                stack.push(child.as_ref());
-            }
-        }
-        results
-    }
-}
-
-// ============ Index ============
-
 struct Index {
     entries: Vec<Entry>,
     arena: Vec<u8>,
-    name_trie: TrieNode,
-    extension_map: HashMap<String, Vec<u32>>,
+    ext_map: HashMap<Box<[u8]>, Vec<u32>>,
 }
 
 impl Index {
-    #[inline]
-    fn str_at(&self, off: u32, len: usize) -> &str {
-        unsafe { std::str::from_utf8_unchecked(&self.arena[off as usize..off as usize + len]) }
+    #[inline(always)]
+    fn get_bytes(&self, off: u32, len: usize) -> &[u8] {
+        &self.arena[off as usize..off as usize + len]
     }
 
-    #[inline]
+    #[inline(always)]
+    fn get_str(&self, off: u32, len: usize) -> &str {
+        unsafe { std::str::from_utf8_unchecked(self.get_bytes(off, len)) }
+    }
+
+    #[inline(always)]
     fn entry_name(&self, e: &Entry) -> &str {
-        self.str_at(e.name_off, e.name_len as usize)
+        self.get_str(e.name_off, e.name_len as usize)
     }
 
-    #[inline]
+    #[inline(always)]
+    fn entry_name_lower(&self, e: &Entry) -> &[u8] {
+        self.get_bytes(e.name_lower_off, e.name_lower_len as usize)
+    }
+
+    #[inline(always)]
     fn entry_path(&self, e: &Entry) -> &str {
-        self.str_at(e.path_off, e.path_len as usize)
+        self.get_str(e.path_off, e.path_len as usize)
     }
-
-    fn search_candidates(&self, query: &str) -> Vec<u32> {
-        let q = query.to_lowercase();
-        let mut candidates = self.name_trie.search_prefix(&q);
-
-        if !q.contains('.') {
-            if let Some(ids) = self.extension_map.get(&q) {
-                candidates.extend(ids);
-            }
-        }
-
-        let mut result: Vec<u32> = candidates.into_iter().collect();
-        result.sort_unstable();
-        result.dedup();
-        result
-    }
-}
-
-// ============ Thread-Safe Index Builder ============
-
-struct FileEntry {
-    name: String,
-    path: String,
-    is_dir: bool,
-    is_hidden: bool,
-    size: u64,
-    modified: u64,
 }
 
 struct IndexBuilder {
     entries: Vec<Entry>,
     arena: Vec<u8>,
-    name_trie: TrieNode,
-    extension_map: HashMap<String, Vec<u32>>,
+    extensions: Vec<(Box<[u8]>, u32)>,
 }
 
 impl IndexBuilder {
-    fn new() -> Self {
+    fn with_capacity(cap: usize) -> Self {
         Self {
-            entries: Vec::with_capacity(500_000),
-            arena: Vec::with_capacity(50_000_000),
-            name_trie: TrieNode::default(),
-            extension_map: HashMap::default(),
+            entries: Vec::with_capacity(cap),
+            arena: Vec::with_capacity(cap * 80),
+            extensions: Vec::with_capacity(cap / 2),
         }
     }
 
-    fn intern(&mut self, s: &str) -> (u32, usize) {
+    #[inline]
+    fn intern(&mut self, s: &str) -> u32 {
         let off = self.arena.len() as u32;
         self.arena.extend_from_slice(s.as_bytes());
-        (off, s.len())
+        off
     }
 
-    fn add_batch(&mut self, batch: Vec<FileEntry>) {
-        for entry in batch {
-            self.add_entry(&entry.name, &entry.path, entry.is_dir, entry.is_hidden, entry.size, entry.modified);
-        }
+    #[inline]
+    fn intern_bytes(&mut self, b: &[u8]) -> u32 {
+        let off = self.arena.len() as u32;
+        self.arena.extend_from_slice(b);
+        off
     }
 
-    fn add_entry(&mut self, name: &str, full_path: &str, is_dir: bool, is_hidden: bool, size: u64, modified: u64) {
+    fn add(
+        &mut self,
+        name: &str,
+        path: &str,
+        is_dir: bool,
+        is_hidden: bool,
+        size: u64,
+        modified: u64,
+    ) {
         let id = self.entries.len() as u32;
-        let (name_off, name_len_usize) = self.intern(name);
-        let (path_off, path_len) = self.intern(full_path);
-        let name_len = name_len_usize.min(u16::MAX as usize) as u16;
+
+        let name_off = self.intern(name);
+        let name_len = name.len().min(u16::MAX as usize) as u16;
+
+        let name_lower = name.to_lowercase();
+        let name_lower_bytes = name_lower.as_bytes();
+        let name_lower_off = self.intern_bytes(name_lower_bytes);
+        let name_lower_len = name_lower_bytes.len().min(u16::MAX as usize) as u16;
+
+        let path_off = self.intern(path);
+        let path_len = path.len() as u32;
 
         let mut flags = 0u16;
         if is_dir {
@@ -303,28 +269,32 @@ impl IndexBuilder {
         self.entries.push(Entry {
             name_off,
             name_len,
+            name_lower_off,
+            name_lower_len,
             path_off,
-            path_len: path_len as u32,
+            path_len,
             size,
             modified,
             flags,
         });
 
-        let name_lower = name.to_lowercase();
-        self.name_trie.insert(&name_lower, id);
-
         if !is_dir {
-            if let Some(ext_start) = name.rfind('.') {
-                let ext = name[ext_start + 1..].to_lowercase();
-                if !ext.is_empty() {
-                    self.extension_map.entry(ext).or_default().push(id);
+            if let Some(dot_pos) = name_lower.rfind('.') {
+                let ext = &name_lower[dot_pos + 1..];
+                if !ext.is_empty() && ext.len() <= 12 {
+                    self.extensions.push((ext.as_bytes().into(), id));
                 }
             }
         }
     }
 
-    fn finalize(mut self) -> Index {
-        for ids in self.extension_map.values_mut() {
+    fn finalize(self) -> Index {
+        let mut ext_map: HashMap<Box<[u8]>, Vec<u32>> = HashMap::with_capacity(256);
+        for (ext, id) in self.extensions {
+            ext_map.entry(ext).or_default().push(id);
+        }
+
+        for ids in ext_map.values_mut() {
             ids.sort_unstable();
             ids.dedup();
         }
@@ -332,13 +302,10 @@ impl IndexBuilder {
         Index {
             entries: self.entries,
             arena: self.arena,
-            name_trie: self.name_trie,
-            extension_map: self.extension_map,
+            ext_map,
         }
     }
 }
-
-// ============ MFT Scanner ============
 
 struct MftScanner {
     drive_letter: char,
@@ -348,7 +315,10 @@ struct MftScanner {
 impl MftScanner {
     unsafe fn open(drive_letter: char) -> Result<Self, String> {
         let volume_path = format!("\\\\.\\{}:", drive_letter);
-        let wide: Vec<u16> = OsStr::new(&volume_path).encode_wide().chain(Some(0)).collect();
+        let wide: Vec<u16> = OsStr::new(&volume_path)
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
 
         let handle = CreateFileW(
             wide.as_ptr(),
@@ -392,7 +362,7 @@ impl MftScanner {
         Ok(journal_data)
     }
 
-    unsafe fn enumerate_mft(&self, tx: Sender<Vec<FileEntry>>) -> Result<u64, String> {
+    unsafe fn enumerate_mft(&self) -> Result<Vec<MftRawEntry>, String> {
         let journal_data = self.query_usn_journal()?;
 
         let mut enum_data = MftEnumDataV0 {
@@ -401,17 +371,12 @@ impl MftScanner {
             high_usn: journal_data.next_usn,
         };
 
-        const BUFFER_SIZE: usize = 8 * 1024 * 1024;
-        let mut buffer = vec![0u8; BUFFER_SIZE];
-        let mut total_count = 0u64;
-        let mut path_map: HashMap<u64, String> = HashMap::default();
-        path_map.insert(0x5000000000005, format!("{}:\\", self.drive_letter));
-
-        let mut batch: Vec<FileEntry> = Vec::with_capacity(10000);
+        let mut buffer = vec![0u8; MFT_BUFFER_SIZE];
+        let mut raw_entries: Vec<MftRawEntry> = Vec::with_capacity(500_000);
 
         loop {
             if CANCEL_FLAG.load(Ordering::Relaxed) {
-                return Ok(total_count);
+                return Ok(raw_entries);
             }
 
             let mut bytes_returned: DWORD = 0;
@@ -421,7 +386,7 @@ impl MftScanner {
                 &mut enum_data as *mut _ as LPVOID,
                 mem::size_of::<MftEnumDataV0>() as DWORD,
                 buffer.as_mut_ptr() as LPVOID,
-                BUFFER_SIZE as DWORD,
+                MFT_BUFFER_SIZE as DWORD,
                 &mut bytes_returned,
                 ptr::null_mut(),
             );
@@ -439,8 +404,9 @@ impl MftScanner {
             }
 
             let mut offset = 8usize;
+            let bytes_ret = bytes_returned as usize;
 
-            while offset + mem::size_of::<UsnRecordV2>() <= bytes_returned as usize {
+            while offset + mem::size_of::<UsnRecordV2>() <= bytes_ret {
                 let record_ptr = buffer.as_ptr().add(offset) as *const UsnRecordV2;
                 let record = &*record_ptr;
 
@@ -451,28 +417,18 @@ impl MftScanner {
                 let filename_offset = offset + record.file_name_offset as usize;
                 let filename_len = (record.file_name_length / 2) as usize;
 
-                if filename_offset + filename_len * 2 <= bytes_returned as usize {
+                if filename_offset + filename_len * 2 <= bytes_ret {
                     let filename_ptr = buffer.as_ptr().add(filename_offset) as *const u16;
                     let filename_slice = slice::from_raw_parts(filename_ptr, filename_len);
                     let filename = String::from_utf16_lossy(filename_slice);
 
-                    if filename != "." && filename != ".." && !filename.starts_with("$") {
+                    if !filename.is_empty()
+                        && filename != "."
+                        && filename != ".."
+                        && !filename.starts_with('$')
+                    {
                         let is_dir = (record.file_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
                         let is_hidden = (record.file_attributes & FILE_ATTRIBUTE_HIDDEN) != 0;
-
-                        let parent_path = path_map.get(&record.parent_file_reference_number).map(|s| s.as_str()).unwrap_or("");
-
-                        let full_path = if parent_path.ends_with('\\') {
-                            format!("{}{}", parent_path, filename)
-                        } else if parent_path.is_empty() {
-                            format!("{}:\\{}", self.drive_letter, filename)
-                        } else {
-                            format!("{}\\{}", parent_path, filename)
-                        };
-
-                        if is_dir {
-                            path_map.insert(record.file_reference_number, full_path.clone());
-                        }
 
                         let modified = {
                             let ft = *record.time_stamp.QuadPart() as u64;
@@ -483,20 +439,14 @@ impl MftScanner {
                             }
                         };
 
-                        batch.push(FileEntry {
-                            name: filename,
-                            path: full_path,
+                        raw_entries.push(MftRawEntry {
+                            file_ref: record.file_reference_number & FILE_REF_MASK,
+                            parent_ref: record.parent_file_reference_number & FILE_REF_MASK,
+                            name: filename.into_boxed_str(),
                             is_dir,
                             is_hidden,
-                            size: 0,
                             modified,
                         });
-
-                        total_count += 1;
-
-                        if batch.len() >= 5000 {
-                            let _ = tx.send(std::mem::replace(&mut batch, Vec::with_capacity(10000)));
-                        }
                     }
                 }
 
@@ -505,11 +455,7 @@ impl MftScanner {
             }
         }
 
-        if !batch.is_empty() {
-            let _ = tx.send(batch);
-        }
-
-        Ok(total_count)
+        Ok(raw_entries)
     }
 }
 
@@ -523,23 +469,81 @@ impl Drop for MftScanner {
     }
 }
 
-// ============ Fallback Scanner ============
+fn build_paths_topological(
+    raw_entries: Vec<MftRawEntry>,
+    drive_letter: char,
+) -> Vec<(String, String, bool, bool, u64)> {
+    if raw_entries.is_empty() {
+        return Vec::new();
+    }
 
-fn scan_drive_fallback(drive: char, tx: Sender<Vec<FileEntry>>) -> Result<u64, String> {
+    let root_ref_masked = ROOT_FILE_REF & FILE_REF_MASK;
+
+    let ref_to_idx: HashMap<u64, usize> = raw_entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.file_ref, i))
+        .collect();
+
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); raw_entries.len()];
+    let mut roots: Vec<usize> = Vec::new();
+
+    for (idx, entry) in raw_entries.iter().enumerate() {
+        if entry.parent_ref == root_ref_masked || entry.parent_ref == 0 {
+            roots.push(idx);
+        } else if let Some(&parent_idx) = ref_to_idx.get(&entry.parent_ref) {
+            children[parent_idx].push(idx);
+        } else {
+            roots.push(idx);
+        }
+    }
+
+    let mut paths: Vec<String> = vec![String::new(); raw_entries.len()];
+    let root_prefix = format!("{}:\\", drive_letter);
+
+    let mut stack: Vec<(usize, String)> = roots
+        .into_iter()
+        .map(|idx| (idx, root_prefix.clone()))
+        .collect();
+
+    while let Some((idx, parent_path)) = stack.pop() {
+        let entry = &raw_entries[idx];
+        let mut path = String::with_capacity(parent_path.len() + entry.name.len() + 1);
+        path.push_str(&parent_path);
+        path.push_str(&entry.name);
+
+        if entry.is_dir && !children[idx].is_empty() {
+            let path_with_sep = format!("{}\\", path);
+            for &child_idx in &children[idx] {
+                stack.push((child_idx, path_with_sep.clone()));
+            }
+        }
+
+        paths[idx] = path;
+    }
+
+    raw_entries
+        .into_iter()
+        .zip(paths.into_iter())
+        .map(|(e, path)| (e.name.to_string(), path, e.is_dir, e.is_hidden, e.modified))
+        .collect()
+}
+
+fn scan_drive_fallback(drive: char) -> Result<Vec<(String, String, bool, bool, u64, u64)>, String> {
+    use ignore::WalkBuilder;
+
     let root = format!("{}:\\", drive);
-    let mut count = 0u64;
-    let mut batch: Vec<FileEntry> = Vec::with_capacity(5000);
+    let results: Mutex<Vec<(String, String, bool, bool, u64, u64)>> =
+        Mutex::new(Vec::with_capacity(100_000));
 
     let walker = WalkBuilder::new(&root)
         .hidden(false)
         .follow_links(false)
-        .threads(4)
+        .threads(num_cpus::get())
         .build_parallel();
 
-    let (entry_tx, entry_rx) = unbounded::<FileEntry>();
-
     walker.run(|| {
-        let tx = entry_tx.clone();
+        let results = &results;
         Box::new(move |entry| {
             if CANCEL_FLAG.load(Ordering::Relaxed) {
                 return ignore::WalkState::Quit;
@@ -549,58 +553,41 @@ fn scan_drive_fallback(drive: char, tx: Sender<Vec<FileEntry>>) -> Result<u64, S
                 let path = entry.path();
                 let name = entry.file_name().to_string_lossy().to_string();
                 let full_path = path.to_string_lossy().to_string();
-
                 let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
                 let is_hidden = name.starts_with('.');
 
-                let (size, modified) = if let Ok(meta) = entry.metadata() {
-                    let sz = if is_dir { 0 } else { meta.len() };
-                    let mt = meta
-                        .modified()
-                        .ok()
-                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    (sz, mt)
-                } else {
-                    (0, 0)
-                };
+                let (size, modified) = entry
+                    .metadata()
+                    .map(|meta| {
+                        let sz = if is_dir { 0 } else { meta.len() };
+                        let mt = meta
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        (sz, mt)
+                    })
+                    .unwrap_or((0, 0));
 
-                let _ = tx.send(FileEntry {
-                    name,
-                    path: full_path,
-                    is_dir,
-                    is_hidden,
-                    size,
-                    modified,
-                });
+                results
+                    .lock()
+                    .push((name, full_path, is_dir, is_hidden, size, modified));
             }
 
             ignore::WalkState::Continue
         })
     });
 
-    drop(entry_tx);
-
-    for entry in entry_rx {
-        batch.push(entry);
-        count += 1;
-
-        if batch.len() >= 5000 {
-            let _ = tx.send(std::mem::replace(&mut batch, Vec::with_capacity(5000)));
-        }
-    }
-
-    if !batch.is_empty() {
-        let _ = tx.send(batch);
-    }
-
-    Ok(count)
+    Ok(results.into_inner())
 }
 
-// ============ Global State ============
-
 static INDEX: Lazy<ArcSwap<Option<Arc<Index>>>> = Lazy::new(|| ArcSwap::new(Arc::new(None)));
+
+static STATS_FILES: AtomicU64 = AtomicU64::new(0);
+static STATS_DIRS: AtomicU64 = AtomicU64::new(0);
+static STATS_SCANNED: AtomicU64 = AtomicU64::new(0);
+
 static INDEX_STATE: Lazy<RwLock<IndexState>> = Lazy::new(|| {
     RwLock::new(IndexState {
         running: false,
@@ -612,14 +599,14 @@ static INDEX_STATE: Lazy<RwLock<IndexState>> = Lazy::new(|| {
         finished: false,
     })
 });
+
 static CANCEL_FLAG: AtomicBool = AtomicBool::new(false);
 
 fn get_drive_type_string(drive_letter: char) -> String {
     unsafe {
         let path = format!("{}:\\", drive_letter);
         let wide: Vec<u16> = OsStr::new(&path).encode_wide().chain(Some(0)).collect();
-        let drive_type = GetDriveTypeW(wide.as_ptr());
-        match drive_type {
+        match GetDriveTypeW(wide.as_ptr()) {
             DRIVE_FIXED => "Локальный диск".to_string(),
             DRIVE_REMOVABLE => "Съёмный диск".to_string(),
             _ => "Другой".to_string(),
@@ -646,11 +633,14 @@ fn list_available_drives() -> Vec<DriveInfo> {
 }
 
 fn emit_state(app: &tauri::AppHandle) {
-    let state = INDEX_STATE.read().clone();
-    let _ = app.emit("index:state", state);
+    let mut state = INDEX_STATE.write();
+    state.total_scanned = STATS_SCANNED.load(Ordering::Relaxed);
+    state.total_files = STATS_FILES.load(Ordering::Relaxed);
+    state.total_dirs = STATS_DIRS.load(Ordering::Relaxed);
+    let state_clone = state.clone();
+    drop(state);
+    let _ = app.emit("index:state", state_clone);
 }
-
-// ============ Commands ============
 
 #[tauri::command]
 fn get_available_drives() -> Vec<DriveInfo> {
@@ -664,6 +654,9 @@ async fn start_indexing(app: tauri::AppHandle, selected_drives: Vec<char>) -> Re
     }
 
     CANCEL_FLAG.store(false, Ordering::Relaxed);
+    STATS_FILES.store(0, Ordering::Relaxed);
+    STATS_DIRS.store(0, Ordering::Relaxed);
+    STATS_SCANNED.store(0, Ordering::Relaxed);
 
     {
         let mut state = INDEX_STATE.write();
@@ -689,96 +682,107 @@ async fn start_indexing(app: tauri::AppHandle, selected_drives: Vec<char>) -> Re
 
     tauri::async_runtime::spawn_blocking(move || {
         let start_time = Instant::now();
-        let (entry_tx, entry_rx) = unbounded::<Vec<FileEntry>>();
 
-        let handles: Vec<_> = selected_drives
-            .iter()
+        let drive_results: Vec<_> = selected_drives
+            .par_iter()
             .map(|&drive| {
-                let tx = entry_tx.clone();
                 let app_clone = app.clone();
 
-                thread::spawn(move || {
-                    let count = unsafe {
-                        match MftScanner::open(drive) {
-                            Ok(scanner) => {
+                let result = unsafe {
+                    match MftScanner::open(drive) {
+                        Ok(scanner) => {
+                            {
+                                let mut state = INDEX_STATE.write();
+                                if let Some(d) = state.drives.iter_mut().find(|d| d.letter == drive)
                                 {
-                                    let mut state = INDEX_STATE.write();
-                                    if let Some(d) = state.drives.iter_mut().find(|d| d.letter == drive) {
-                                        d.method = "MFT".to_string();
-                                    }
+                                    d.method = "MFT".to_string();
                                 }
-                                scanner.enumerate_mft(tx.clone())
                             }
-                            Err(_) => {
-                                {
-                                    let mut state = INDEX_STATE.write();
-                                    if let Some(d) = state.drives.iter_mut().find(|d| d.letter == drive) {
-                                        d.method = "Walker".to_string();
-                                    }
-                                }
-                                scan_drive_fallback(drive, tx.clone())
-                            }
-                        }
-                    };
+                            emit_state(&app_clone);
 
-                    {
-                        let mut state = INDEX_STATE.write();
-                        if let Some(d) = state.drives.iter_mut().find(|d| d.letter == drive) {
-                            d.finished = true;
-                            if let Ok(c) = count {
-                                d.scanned = c;
+                            scanner.enumerate_mft().map(|raw| {
+                                let entries = build_paths_topological(raw, drive);
+                                entries
+                                    .into_iter()
+                                    .map(|(name, path, is_dir, is_hidden, modified)| {
+                                        (name, path, is_dir, is_hidden, 0u64, modified)
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                        }
+                        Err(_) => {
+                            {
+                                let mut state = INDEX_STATE.write();
+                                if let Some(d) = state.drives.iter_mut().find(|d| d.letter == drive)
+                                {
+                                    d.method = "Walker".to_string();
+                                }
                             }
+                            emit_state(&app_clone);
+                            scan_drive_fallback(drive)
                         }
                     }
-                    emit_state(&app_clone);
+                };
 
-                    count
-                })
+                let count = result.as_ref().map(|v| v.len() as u64).unwrap_or(0);
+                STATS_SCANNED.fetch_add(count, Ordering::Relaxed);
+
+                {
+                    let mut state = INDEX_STATE.write();
+                    if let Some(d) = state.drives.iter_mut().find(|d| d.letter == drive) {
+                        d.finished = true;
+                        d.scanned = count;
+                    }
+                }
+                emit_state(&app_clone);
+
+                result
             })
             .collect();
 
-        drop(entry_tx);
+        if CANCEL_FLAG.load(Ordering::Relaxed) {
+            let mut state = INDEX_STATE.write();
+            state.running = false;
+            state.finished = true;
+            state.elapsed_ms = start_time.elapsed().as_millis() as u64;
+            emit_state(&app);
+            return;
+        }
 
-        let mut builder = IndexBuilder::new();
-        let mut last_emit = Instant::now();
+        let total_entries: usize = drive_results
+            .iter()
+            .filter_map(|r| r.as_ref().ok())
+            .map(|v| v.len())
+            .sum();
 
-        for batch in entry_rx {
-            if CANCEL_FLAG.load(Ordering::Relaxed) {
-                break;
-            }
+        let mut builder = IndexBuilder::with_capacity(total_entries);
 
-            let files_count = batch.iter().filter(|e| !e.is_dir).count() as u64;
-            let dirs_count = batch.iter().filter(|e| e.is_dir).count() as u64;
-
-            builder.add_batch(batch);
-
-            {
-                let mut state = INDEX_STATE.write();
-                state.total_scanned = builder.entries.len() as u64;
-                state.total_files += files_count;
-                state.total_dirs += dirs_count;
-            }
-
-            if last_emit.elapsed() > Duration::from_millis(100) {
-                emit_state(&app);
-                last_emit = Instant::now();
+        for result in drive_results {
+            if let Ok(entries) = result {
+                for (name, path, is_dir, is_hidden, size, modified) in entries {
+                    if is_dir {
+                        STATS_DIRS.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        STATS_FILES.fetch_add(1, Ordering::Relaxed);
+                    }
+                    builder.add(&name, &path, is_dir, is_hidden, size, modified);
+                }
             }
         }
 
-        for handle in handles {
-            let _ = handle.join();
-        }
+        emit_state(&app);
 
-        if !CANCEL_FLAG.load(Ordering::Relaxed) {
-            let index = builder.finalize();
-            INDEX.store(Arc::new(Some(Arc::new(index))));
-        }
+        let index = builder.finalize();
+        INDEX.store(Arc::new(Some(Arc::new(index))));
 
         {
             let mut state = INDEX_STATE.write();
             state.running = false;
             state.finished = true;
             state.elapsed_ms = start_time.elapsed().as_millis() as u64;
+            state.total_files = STATS_FILES.load(Ordering::Relaxed);
+            state.total_dirs = STATS_DIRS.load(Ordering::Relaxed);
+            state.total_scanned = STATS_SCANNED.load(Ordering::Relaxed);
         }
         emit_state(&app);
     });
@@ -804,13 +808,26 @@ async fn search(query: String, filters: FilterOptions) -> Vec<SearchResult> {
         None => return vec![],
     };
 
-    let candidates = index.search_candidates(q);
+    let q_lower = q.to_lowercase();
+    let q_bytes = q_lower.as_bytes();
     let max_results = filters.max_results as usize;
 
-    let mut results: Vec<SearchResult> = candidates
-        .par_iter()
-        .filter_map(|&id| {
-            let entry = index.entries.get(id as usize)?;
+    let type_filters: Vec<Vec<u8>> = filters
+        .file_types
+        .iter()
+        .map(|ft| ft.trim().trim_start_matches('.').to_lowercase())
+        .filter(|ft| !ft.is_empty())
+        .map(|ft| ft.into_bytes())
+        .collect();
+
+    let has_type_filter = !type_filters.is_empty();
+
+    let entry_count = index.entries.len();
+
+    let mut results: Vec<(SearchResult, f32)> = (0..entry_count)
+        .into_par_iter()
+        .filter_map(|id| {
+            let entry = &index.entries[id];
 
             if !filters.include_hidden && entry.is_hidden() {
                 return None;
@@ -829,28 +846,28 @@ async fn search(query: String, filters: FilterOptions) -> Vec<SearchResult> {
                 }
             }
 
-            if !filters.file_types.is_empty() && !entry.is_dir() {
-                let name = index.entry_name(entry);
-                let ext = name.rfind('.').map(|i| &name[i + 1..]).unwrap_or("");
-                let ext_lower = ext.to_lowercase();
+            let name_lower = index.entry_name_lower(entry);
 
-                if !filters.file_types.iter().any(|ft| {
-                    let ft_clean = ft.trim_start_matches('.');
-                    ft_clean.eq_ignore_ascii_case(&ext_lower)
-                }) {
+            let finder = Finder::new(q_bytes);
+            let match_pos = finder.find(name_lower)?;
+
+            if has_type_filter && !entry.is_dir() {
+                let has_matching_ext = name_lower
+                    .iter()
+                    .rposition(|&b| b == b'.')
+                    .map(|dot_pos| {
+                        let ext = &name_lower[dot_pos + 1..];
+                        type_filters.iter().any(|tf| tf.as_slice() == ext)
+                    })
+                    .unwrap_or(false);
+
+                if !has_matching_ext {
                     return None;
                 }
             }
 
-            let name = index.entry_name(entry).to_string();
-            let path = index.entry_path(entry).to_string();
-
-            let q_lower = q.to_lowercase();
-            let name_lower = name.to_lowercase();
-
-            if !name_lower.contains(&q_lower) {
-                return None;
-            }
+            let name = index.entry_name(entry);
+            let path = index.entry_path(entry);
 
             let modified_str = if entry.modified > 0 {
                 let st = UNIX_EPOCH + Duration::from_secs(entry.modified);
@@ -859,118 +876,96 @@ async fn search(query: String, filters: FilterOptions) -> Vec<SearchResult> {
                 String::new()
             };
 
-            Some(SearchResult {
-                name,
-                path,
-                size: entry.size,
-                modified: modified_str,
-                is_dir: entry.is_dir(),
-                score: Some(calculate_score(&name_lower, &q_lower)),
-            })
+            let score = calculate_score(name_lower.len(), q_bytes.len(), match_pos);
+
+            Some((
+                SearchResult {
+                    name: name.to_string(),
+                    path: path.to_string(),
+                    size: entry.size,
+                    modified: modified_str,
+                    is_dir: entry.is_dir(),
+                    score: Some(score),
+                },
+                score,
+            ))
         })
         .collect();
 
-    results.par_sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
+    results.par_sort_unstable_by(|a, b| {
+        b.1.partial_cmp(&a.1)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            .then_with(|| a.0.name.len().cmp(&b.0.name.len()))
     });
 
     results.truncate(max_results);
-    results
+    results.into_iter().map(|(r, _)| r).collect()
 }
-
-// ============ File Operations Commands ============
 
 #[tauri::command]
 async fn open_file(path: String) -> Result<(), String> {
     use std::process::Command;
-
-    #[cfg(target_os = "windows")]
-    {
-        Command::new("cmd")
-            .args(&["/C", "start", "", &path])
-            .spawn()
-            .map_err(|e| format!("Не удалось открыть файл: {}", e))?;
-    }
-
+    Command::new("cmd")
+        .args(["/C", "start", "", &path])
+        .spawn()
+        .map_err(|e| format!("Не удалось открыть файл: {}", e))?;
     Ok(())
 }
 
 #[tauri::command]
 async fn open_folder(path: String) -> Result<(), String> {
     use std::process::Command;
-
-    let folder_path = if let Some(parent) = Path::new(&path).parent() {
-        parent.to_string_lossy().to_string()
-    } else {
-        path
-    };
-
-    #[cfg(target_os = "windows")]
-    {
-        Command::new("explorer")
-            .arg(&folder_path)
-            .spawn()
-            .map_err(|e| format!("Не удалось открыть папку: {}", e))?;
-    }
-
+    let folder_path = Path::new(&path)
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or(path);
+    Command::new("explorer")
+        .arg(&folder_path)
+        .spawn()
+        .map_err(|e| format!("Не удалось открыть папку: {}", e))?;
     Ok(())
 }
 
 #[tauri::command]
 async fn open_folder_and_select(path: String) -> Result<(), String> {
     use std::process::Command;
-
-    #[cfg(target_os = "windows")]
-    {
-        Command::new("explorer")
-            .args(&["/select,", &path])
-            .spawn()
-            .map_err(|e| format!("Не удалось открыть: {}", e))?;
-    }
-
+    Command::new("explorer")
+        .args(["/select,", &path])
+        .spawn()
+        .map_err(|e| format!("Не удалось открыть: {}", e))?;
     Ok(())
 }
 
 #[tauri::command]
 async fn delete_file(path: String) -> Result<(), String> {
     let p = Path::new(&path);
-
     if p.is_dir() {
         fs::remove_dir_all(p).map_err(|e| format!("Не удалось удалить папку: {}", e))?;
     } else {
         fs::remove_file(p).map_err(|e| format!("Не удалось удалить файл: {}", e))?;
     }
-
     Ok(())
 }
 
 #[tauri::command]
 async fn rename_file(old_path: String, new_name: String) -> Result<String, String> {
     let old = Path::new(&old_path);
-    let parent = old.parent().ok_or("Невозможно получить родительскую папку")?;
+    let parent = old
+        .parent()
+        .ok_or("Невозможно получить родительскую папку")?;
     let new_path = parent.join(&new_name);
-
     fs::rename(old, &new_path).map_err(|e| format!("Не удалось переименовать: {}", e))?;
-
     Ok(new_path.to_string_lossy().to_string())
 }
 
 #[tauri::command]
 async fn copy_path_to_clipboard(path: String) -> Result<(), String> {
     use std::process::Command;
-
-    #[cfg(target_os = "windows")]
-    {
-        let powershell_cmd = format!("Set-Clipboard -Value '{}'", path.replace("'", "''"));
-        Command::new("powershell")
-            .args(&["-Command", &powershell_cmd])
-            .output()
-            .map_err(|e| format!("Не удалось скопировать путь: {}", e))?;
-    }
-
+    let powershell_cmd = format!("Set-Clipboard -Value '{}'", path.replace('\'', "''"));
+    Command::new("powershell")
+        .args(["-Command", &powershell_cmd])
+        .output()
+        .map_err(|e| format!("Не удалось скопировать путь: {}", e))?;
     Ok(())
 }
 
@@ -983,7 +978,10 @@ fn get_file_properties(path: String) -> Result<StdHashMap<String, String>, Strin
     props.insert("size".to_string(), meta.len().to_string());
     props.insert("is_dir".to_string(), meta.is_dir().to_string());
     props.insert("is_file".to_string(), meta.is_file().to_string());
-    props.insert("readonly".to_string(), meta.permissions().readonly().to_string());
+    props.insert(
+        "readonly".to_string(),
+        meta.permissions().readonly().to_string(),
+    );
 
     if let Ok(modified) = meta.modified() {
         if let Ok(duration) = modified.duration_since(UNIX_EPOCH) {
@@ -994,28 +992,26 @@ fn get_file_properties(path: String) -> Result<StdHashMap<String, String>, Strin
     Ok(props)
 }
 
-// ============ Utility Functions ============
-
-fn calculate_score(text: &str, query: &str) -> f32 {
-    if text == query {
+#[inline(always)]
+fn calculate_score(name_len: usize, query_len: usize, match_pos: usize) -> f32 {
+    if name_len == query_len && match_pos == 0 {
         return 100.0;
     }
-    if text.starts_with(query) {
-        return 90.0;
+    if match_pos == 0 {
+        return 90.0 + (10.0 * query_len as f32 / name_len as f32);
     }
-    let pos = text.find(query).unwrap_or(text.len());
-    let score = 50.0 - (pos as f32 / text.len() as f32) * 30.0;
-    score.max(10.0)
+    let pos_penalty = (match_pos as f32 * 2.0).min(30.0);
+    let len_bonus = (query_len as f32 / name_len as f32) * 20.0;
+    60.0 - pos_penalty + len_bonus
 }
 
 fn format_system_time(st: SystemTime) -> Option<String> {
-    const FMT: &[FormatItem<'static>] = format_description!("[year]-[month]-[day] [hour]:[minute]");
+    const FMT: &[FormatItem<'static>] =
+        format_description!("[year]-[month]-[day] [hour]:[minute]");
     let dur = st.duration_since(UNIX_EPOCH).ok()?;
     let odt = time::OffsetDateTime::from_unix_timestamp(dur.as_secs() as i64).ok()?;
     Some(odt.format(FMT).ok()?)
 }
-
-// ============ Main ============
 
 fn main() {
     tauri::Builder::default()
