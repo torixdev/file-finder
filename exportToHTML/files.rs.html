@@ -1,0 +1,93 @@
+<html>
+<head>
+    <title>files.rs</title>
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+    <style type="text/css">
+        .s0 {
+            color: #bcbec4;
+        }
+
+        .s1 {
+            color: #bcbec4;
+        }
+
+        .s2 {
+            color: #cf8e6d;
+        }
+
+        .s3 {
+            color: #6aab73;
+        }
+    </style>
+</head>
+<body bgcolor="#191a1c">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060">
+    <tr>
+        <td>
+            <center>
+                <font face="Arial, Helvetica" color="#000000">
+                    files.rs</font>
+            </center>
+        </td>
+    </tr>
+</table>
+<pre><span class="s0">#[</span><span class="s1">tauri</span><span class="s0">::</span><span
+        class="s1">command</span><span class="s0">]</span>
+<span class="s2">pub fn </span><span class="s1">get_file_properties</span><span class="s0">(</span><span
+            class="s1">path</span><span class="s0">: </span><span class="s1">String</span><span
+            class="s0">) -&gt; </span><span class="s1">Result</span><span class="s0">&lt;</span><span
+            class="s1">HashMap</span><span class="s0">&lt;</span><span class="s1">String</span><span
+            class="s0">, </span><span class="s1">String</span><span class="s0">&gt;, </span><span
+            class="s1">String</span><span class="s0">&gt; {</span>
+    <span class="s2">let </span><span class="s1">p </span><span class="s0">= </span><span class="s1">Path</span><span
+            class="s0">::</span><span class="s1">new</span><span class="s0">(&amp;</span><span
+            class="s1">path</span><span class="s0">);</span>
+    <span class="s2">let </span><span class="s1">meta </span><span class="s0">= </span><span class="s1">fs</span><span
+            class="s0">::</span><span class="s1">metadata</span><span class="s0">(</span><span class="s1">p</span><span
+            class="s0">).</span><span class="s1">map_err</span><span class="s0">(|</span><span class="s1">e</span><span
+            class="s0">| </span><span class="s1">format</span><span class="s0">!(</span><span class="s3">&quot;Не удалось получить информацию: {}&quot;</span><span
+            class="s0">, </span><span class="s1">e</span><span class="s0">))?;</span>
+
+    <span class="s2">let mut </span><span class="s1">props </span><span class="s0">= </span><span
+            class="s1">HashMap</span><span class="s0">::</span><span class="s1">new</span><span class="s0">();</span>
+    <span class="s1">props</span><span class="s0">.</span><span class="s1">insert</span><span class="s0">(</span><span
+            class="s3">&quot;size&quot;</span><span class="s0">.</span><span class="s1">to_string</span><span
+            class="s0">(), </span><span class="s1">meta</span><span class="s0">.</span><span class="s1">len</span><span
+            class="s0">().</span><span class="s1">to_string</span><span class="s0">());</span>
+    <span class="s1">props</span><span class="s0">.</span><span class="s1">insert</span><span class="s0">(</span><span
+            class="s3">&quot;is_dir&quot;</span><span class="s0">.</span><span class="s1">to_string</span><span
+            class="s0">(), </span><span class="s1">meta</span><span class="s0">.</span><span
+            class="s1">is_dir</span><span class="s0">().</span><span class="s1">to_string</span><span
+            class="s0">());</span>
+    <span class="s1">props</span><span class="s0">.</span><span class="s1">insert</span><span class="s0">(</span><span
+            class="s3">&quot;is_file&quot;</span><span class="s0">.</span><span class="s1">to_string</span><span
+            class="s0">(), </span><span class="s1">meta</span><span class="s0">.</span><span
+            class="s1">is_file</span><span class="s0">().</span><span class="s1">to_string</span><span
+            class="s0">());</span>
+    <span class="s1">props</span><span class="s0">.</span><span class="s1">insert</span><span class="s0">(</span>
+        <span class="s3">&quot;readonly&quot;</span><span class="s0">.</span><span class="s1">to_string</span><span
+            class="s0">(),</span>
+        <span class="s1">meta</span><span class="s0">.</span><span class="s1">permissions</span><span
+            class="s0">().</span><span class="s1">readonly</span><span class="s0">().</span><span
+            class="s1">to_string</span><span class="s0">(),</span>
+    <span class="s0">);</span>
+
+    <span class="s2">if let </span><span class="s1">Ok</span><span class="s0">(</span><span
+            class="s1">modified</span><span class="s0">) = </span><span class="s1">meta</span><span
+            class="s0">.</span><span class="s1">modified</span><span class="s0">() {</span>
+        <span class="s2">if let </span><span class="s1">Ok</span><span class="s0">(</span><span
+            class="s1">duration</span><span class="s0">) = </span><span class="s1">modified</span><span
+            class="s0">.</span><span class="s1">duration_since</span><span class="s0">(</span><span class="s1">UNIX_EPOCH</span><span
+            class="s0">) {</span>
+            <span class="s1">props</span><span class="s0">.</span><span class="s1">insert</span><span
+            class="s0">(</span><span class="s3">&quot;modified&quot;</span><span class="s0">.</span><span class="s1">to_string</span><span
+            class="s0">(), </span><span class="s1">duration</span><span class="s0">.</span><span
+            class="s1">as_secs</span><span class="s0">().</span><span class="s1">to_string</span><span
+            class="s0">());</span>
+        <span class="s0">}</span>
+    <span class="s0">}</span>
+
+    <span class="s1">Ok</span><span class="s0">(</span><span class="s1">props</span><span class="s0">)</span>
+<span class="s0">}</span></pre>
+</body>
+</html>
