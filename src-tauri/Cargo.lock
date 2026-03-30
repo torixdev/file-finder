@@ -954,10 +954,10 @@ version = "0.1.0"
 dependencies = [
  "ahash",
  "arc-swap",
+    "crossbeam-channel",
  "ignore",
  "memchr",
  "num_cpus",
- "once_cell",
  "parking_lot",
  "rayon",
  "serde",
